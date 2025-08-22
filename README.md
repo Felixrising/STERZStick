@@ -8,11 +8,17 @@ This project transforms your M5StickCPlus2 into a professional-grade steering co
 
 - **Mahony AHRS algorithm** for stable yaw calculation
 - **Advanced power management** with adaptive CPU/IMU frequency scaling
-- **Motion-based sleep system** with 120-second timeout
+- **Motion-based sleep system** with intelligent timeout management
 - **Comprehensive calibration system** with visual feedback
 - **1-degree steering precision** (vs 10-degree binning)
 - **Drift compensation** and automatic centering
 - **Professional button handling** with short/long press actions
+
+## 🛒 Get Your M5StickCPlus2
+
+[![M5StickCPlus2](images/4_0977f4c6-d95d-49bd-8dc0-aa02c9464fd8_1200x1200.webp)](https://s.click.aliexpress.com/e/_oocIGLh)
+
+**Support further development!** This is an [affiliate link](https://s.click.aliexpress.com/e/_oocIGLh) to purchase the M5StickCPlus2. Your purchase helps fund ongoing improvements to STERZStick.
 
 ## 🚀 Features
 
@@ -24,11 +30,11 @@ This project transforms your M5StickCPlus2 into a professional-grade steering co
 - ✅ **Drift Compensation** - Gradual centering force prevents long-term drift
 
 ### Power Management
-- ⚡ **Adaptive IMU Frequency** - 50Hz normal, 10Hz low power (vs 100Hz+ typical)
-- ⚡ **CPU Frequency Scaling** - 240MHz active, 80MHz idle (66% power reduction)
-- ⚡ **Motion-Based Sleep** - Enters sleep after 120s of inactivity (BLE disconnected)
-- ⚡ **Timer Sleep Cycles** - 30-second wake intervals for motion detection
-- ⚡ **Smart LED Control** - Adaptive brightness (12.5% → 3% → 0%)
+- ⚡ **Optimized IMU Frequency** - 25Hz operation for balanced performance and power efficiency
+- ⚡ **Efficient CPU Frequency** - 80MHz operation for optimal BLE compatibility and power savings
+- ⚡ **Smart Sleep System** - Multiple sleep modes based on activity and connection status
+- ⚡ **Motion Detection** - 30-second motion detection for intelligent wake/sleep decisions
+- ⚡ **Adaptive Power States** - Automatic transitions between active, low-power, and sleep modes
 
 ### User Interface
 - 📱 **Real-time Display** - Yaw angle, steering bin, BLE status, power mode
@@ -38,11 +44,12 @@ This project transforms your M5StickCPlus2 into a professional-grade steering co
 - 📱 **Power Status** - Shows current power mode and sleep countdowns
 
 ### Button Controls
-- 🔘 **Button A Short** - Quick yaw recenter
-- 🔘 **Button A Long (2s)** - Full calibration sequence
-- 🔘 **Button B Short** - Quick yaw recenter  
-- 🔘 **Button B Long (3s)** - Full calibration sequence
+- 🔘 **Button A Short** - Wake display and reset activity timer
+- 🔘 **Button A Long (2s)** - Quick yaw recenter
+- 🔘 **Button B Short** - Quick yaw recenter
+- 🔘 **Button B Long (2s)** - Full calibration sequence
 - 🔘 **Button C Short** - Wake display
+- 🔘 **Button C Medium (2-3s)** - Wake display
 - 🔘 **Button C Long (3s)** - Power off/sleep mode
 
 ## 🛠 Hardware Requirements
@@ -60,8 +67,8 @@ This project transforms your M5StickCPlus2 into a professional-grade steering co
 ### Setup
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/M5StickCPlus2-Sterzo.git
-cd M5StickCPlus2-Sterzo
+git clone https://github.com/Felixrising/STERZStick.git
+cd STERZStick
 
 # Build and upload
 pio run --target upload
@@ -72,6 +79,7 @@ pio device monitor
 
 ### Dependencies
 All dependencies are automatically managed by PlatformIO:
+
 - `M5Unified` - M5StickCPlus2 hardware abstraction
 - `ESP32 BLE Arduino` - Bluetooth Low Energy support
 - `Preferences` - Non-volatile storage
@@ -91,17 +99,18 @@ All dependencies are automatically managed by PlatformIO:
 4. **Auto-Centering** - Device gradually returns to center when not actively steering
 
 ### Power Management
-- **Active Use** - Full performance during Zwift sessions
-- **Idle Mode** - Automatic power reduction after 30 seconds
-- **Sleep Mode** - Enters sleep after 120 seconds of no motion (when BLE disconnected)
-- **Wake Up** - Move device or press Button A to wake from sleep
+- **Active Use** - Full performance during Zwift sessions (80MHz CPU, 25Hz IMU)
+- **Low Power Mode** - Automatic power reduction after 2 minutes of inactivity
+- **BLE Wait Mode** - 5-minute timeout waiting for Zwift connection
+- **Motion Detection** - 30-second motion detection for smart wake/sleep decisions
+- **Wake Up** - Move device or press any button to wake from sleep
 
 ## 🔧 Technical Details
 
 ### IMU Configuration
 - **Sensor** - MPU6886 6-axis IMU (gyroscope + accelerometer)
 - **Algorithm** - Mahony AHRS for quaternion-based orientation
-- **Sampling Rate** - 50Hz normal, 10Hz low power
+- **Sampling Rate** - 25Hz for optimal performance and power efficiency
 - **Calibration** - 6-point accelerometer + gyro bias compensation
 
 ### BLE Protocol
@@ -111,10 +120,10 @@ All dependencies are automatically managed by PlatformIO:
 - **Zwift Handshake** - Full protocol compatibility
 
 ### Power Specifications
-- **Active Current** - ~80-120mA (240MHz, 50Hz IMU, BLE active)
-- **Low Power Current** - ~30-50mA (80MHz, 10Hz IMU, reduced BLE)
+- **Active Current** - ~50-80mA (80MHz CPU, 25Hz IMU, BLE active)
+- **Low Power Current** - ~30-50mA (80MHz CPU, 25Hz IMU, reduced BLE)
 - **Sleep Current** - ~5-10mA (timer sleep cycles)
-- **Battery Life** - 2-4 hours active use, days/weeks standby
+- **Battery Life** - 3-5 hours active use, days/weeks standby
 
 ## 🔄 Calibration System
 
@@ -125,7 +134,7 @@ All dependencies are automatically managed by PlatformIO:
 
 ### Manual Calibration
 - **Quick Recenter** - Short press Button A or B
-- **Full Calibration** - Long press Button A (2s) or Button B (3s)
+- **Full Calibration** - Long press Button A (2s) or Button B (2s)
 - **Progress Feedback** - Visual progress bars and audio beeps
 
 ## 🐛 Troubleshooting
@@ -145,7 +154,7 @@ All dependencies are automatically managed by PlatformIO:
 **Device goes to sleep too quickly:**
 - Motion detection requires actual movement/rotation
 - BLE connection prevents sleep mode
-- Adjust `MOTION_SLEEP_TIMEOUT` in code if needed
+- Adjust timeout values in code if needed
 
 **Yaw drift over time:**
 - Built-in drift compensation should handle minor drift
@@ -154,6 +163,7 @@ All dependencies are automatically managed by PlatformIO:
 
 ### Debug Information
 Enable serial monitoring to see detailed debug output:
+
 ```bash
 pio device monitor
 ```
@@ -179,8 +189,8 @@ Contributions are welcome! Please feel free to submit issues, feature requests, 
 ### Development Setup
 ```bash
 # Clone with development dependencies
-git clone https://github.com/yourusername/M5StickCPlus2-Sterzo.git
-cd M5StickCPlus2-Sterzo
+git clone https://github.com/Felixrising/STERZStick.git
+cd STERZStick
 
 # Build in debug mode
 pio run -e debug
