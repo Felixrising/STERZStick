@@ -1,4 +1,4 @@
-# M5StickCPlus2-Sterzo
+# ZTEERStick v1.0-RC1
 
 A high-performance Zwift steering device using the M5StickCPlus2 with advanced IMU/AHRS implementation, power management, and BLE connectivity.
 
