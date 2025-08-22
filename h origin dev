@@ -1,0 +1,3 @@
+[33mec2c751[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mdev[m[33m)[m Update README with project rename to ZTEERStick v1.0-RC1
+[33mc41cffd[m[33m ([m[1;33mtag: [m[1;33mv1.0-RC1[m[33m, [m[1;31morigin/dev[m[33m, [m[1;31morigin/HEAD[m[33m)[m v1.0-RC1: Add LittleFS support and enhanced splash screen
+[33m18b79f7[m[33m ([m[1;33mtag: [m[1;33mv0.1-RC3[m[33m)[m v0.1-RC3: Concise README with prominent ESP32Sterzo attribution - Reduced README from 270 to 80 lines for better readability - Added prominent acknowledgment of @stefaandesmet2003 ESP32Sterzo fork - Clarified this is an IMU-driven implementation adaptable to any ESP32+IMU - Maintained all essential information while improving scannability

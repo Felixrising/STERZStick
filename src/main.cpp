@@ -677,7 +677,7 @@ void drawModernDisplay(float yaw, bool connected, PowerMode powerMode, float bat
   displaySprite.setTextColor(TFT_WHITE);
   displaySprite.setTextDatum(TC_DATUM); // Top-Center
   displaySprite.setFont(&fonts::Font2);
-  displaySprite.drawString("ZTEERStick", displaySprite.width()/2, 3);
+  displaySprite.drawString("STERZStick", displaySprite.width()/2, 3);
 
   // Header - Row 2: Status Icons
   displaySprite.setTextDatum(TL_DATUM); // Top-Left
@@ -1654,7 +1654,7 @@ void saveIMUCalibration() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== ZTEERStick STARTUP ===");
+  Serial.println("=== STERZStick STARTUP ===");
   
   // Power management: Set HOLD pin high to maintain power
   pinMode(4, OUTPUT);
@@ -1697,7 +1697,7 @@ void setup() {
   initializeDisplayBuffer();
   
 
-  showSplashOverlay("ZTEERStick", "logo.jpg", "Let's ride!", 2000);
+  showSplashOverlay("STERZStick", "logo.jpg", "Let's ride!", 2000);
   
   Serial.println("Display configured at 5% brightness with modern UI");
   
@@ -1866,7 +1866,7 @@ void setup() {
   M5.Display.clear();
   M5.Display.setRotation(0);  
   M5.Display.setCursor(10, 20);
-  M5.Display.print("ZTEERStick");
+  M5.Display.print("STERZStick");
   M5.Display.setCursor(10, 50);
   M5.Display.print("Ready!");
   M5.Display.setCursor(10, 80);
@@ -1874,7 +1874,7 @@ void setup() {
   M5.Display.setCursor(10, 110);
   M5.Display.printf("5%% Screen");
   
-  Serial.println("=== ZTEERStick READY ===");
+  Serial.println("=== STERZStick READY ===");
   
   // Clear the startup message and prepare for the main display
   displaySprite.fillSprite(TFT_BLACK);
