@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <LittleFS.h>
 #include <M5Unified.h>
 #include <Preferences.h>
 #include <BLEDevice.h>
@@ -7,102 +8,216 @@
 #include <BLE2902.h>
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
-#include <Wire.h>
+#include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <esp_pm.h>
+#include <driver/rtc_io.h>
+#include <soc/rtc_cntl_reg.h>
+#include <soc/sens_reg.h>
+#include <driver/adc.h>
+#include <esp32/ulp.h>
 
-// Include the MahonyAHRS library
-#include "libs/MahonyAHRS.h"
 
-// —————— BLE UUIDs ——————
+
+#ifdef ESP32
+extern HardwareSerial Serial;
+#endif
+
+// —————— Function Declarations ——————
+void performFullCalibration();
+void performGyroCalibration();
+void recenterYaw();
+void sendSteeringBin(float bin);
+float applyYawDriftCompensation(float currentYaw);
+void resetYawDrift();
+void filterGyroReadings(float gx, float gy, float gz);
+bool calibrationExists();
+void performAutoCalibration();
+void performAutoRecenter();
+void initializeMahonyFilter();
+void quickRecenterYaw();
+bool detectMotion(float gx, float gy, float gz, float ax, float ay, float az);
+bool hasSignificantAccumulatedMotion();
+void updatePowerManagement(float gx, float gy, float gz, float ax, float ay, float az);
+void updateLEDBreathing();
+void configurePowerManagement();
+void setupIMUWakeup();
+void handleWakeupFromSleep();
+void enterScreenOffMode();
+void exitScreenOffMode();
+void enterULPSleep();
+void setupULPProgram();
+void wakePulse();
+void executeCentering();
+
+// —————— NEW IMU CALIBRATION SYSTEM ——————
+void startIMUCalibration();
+void updateIMUCalibration(uint32_t countdown, bool clear = false);
+void stopIMUCalibration();
+bool loadIMUCalibration();
+void saveIMUCalibration();
+
+void enterBLEWaitingMode();
+void enterLowPowerMode();
+void enterBLEActiveMode();
+void stopBLE();
+void startBLE();
+
+// —————— Pin & BLE UUIDs ——————
+static const int LED_PIN = 19;    // onboard LED on GPIO19
+
 #define STERZO_SERVICE_UUID "347b0001-7635-408b-8918-8ff3949ce592"
+#define CHAR14_UUID         "347b0014-7635-408b-8918-8ff3949ce592"
 #define CHAR30_UUID         "347b0030-7635-408b-8918-8ff3949ce592"
 #define CHAR31_UUID         "347b0031-7635-408b-8918-8ff3949ce592"
 #define CHAR32_UUID         "347b0032-7635-408b-8918-8ff3949ce592"
 
-// —————— Pin Definitions ——————
-static const int LED_PIN = 19;    // onboard LED on GPIO19
+// —————— Mahony AHRS Implementation ——————
+#define twoKpDef  (2.0f * 0.5f) // 2 * proportional gain
+#define twoKiDef  (2.0f * 0.0f) // 2 * integral gain
 
-// —————— RTC Memory Variables ——————
-RTC_DATA_ATTR int wakeCount = 0;
-RTC_DATA_ATTR int timerWakeCount = 0;
-RTC_DATA_ATTR int activityWakeCount = 0;
+float twoKp = twoKpDef;    // 2 * proportional gain (Kp)
+float twoKi = twoKiDef;    // 2 * integral gain (Ki)
+float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f; // quaternion of sensor frame relative to auxiliary frame
+float integralFBx = 0.0f, integralFBy = 0.0f, integralFBz = 0.0f;  // integral error terms scaled by Ki
+float invSampleFreq;
+char anglesComputed;
 
-// Sleep baseline data (gravity vector before sleep)
-RTC_DATA_ATTR float sleepGravityX = 0.0f;
-RTC_DATA_ATTR float sleepGravityY = 0.0f;
-RTC_DATA_ATTR float sleepGravityZ = 0.0f;
-
-// —————— Global Variables ——————
-Preferences prefs;
+// —————— Globals ——————
+Preferences    prefs;
 
 // BLE objects
-BLEServer* pServer = nullptr;
-BLEService* pSvc = nullptr;
-BLECharacteristic* pChar30 = nullptr;
-BLECharacteristic* pChar31 = nullptr;
-BLECharacteristic* pChar32 = nullptr;
+BLEServer*        pServer;
+BLEService*       pSvc;
+BLECharacteristic* pChar14;
+BLECharacteristic* pChar30;
+BLECharacteristic* pChar31;
+BLECharacteristic* pChar32;
+BLE2902*          p2902_14;
+BLE2902*          p2902_30;
+BLE2902*          p2902_32;
 
 bool deviceConnected = false;
-bool ind32On = false;
-bool challengeOK = false;
+bool ind32On        = false;
+bool challengeOK    = false;
+bool zwiftConnected  = false; // Track if actively connected to Zwift
 
-// IMU and orientation
-float currentPitch = 0.0f;
-float currentRoll = 0.0f;
-float currentYaw = 0.0f;
-float currentGravityX = 0.0f;
-float currentGravityY = 0.0f;
-float currentGravityZ = 0.0f;
-
-// Calibration data
-float gyroBiasX = 0, gyroBiasY = 0, gyroBiasZ = 0;
-float accelBiasX = 0, accelBiasY = 0, accelBiasZ = 0;
-float yawOffset = 0;
+// IMU calibration & steering state
+float gyroBiasX=0, gyroBiasY=0, gyroBiasZ=0;
+float accelBiasX=0, accelBiasY=0, accelBiasZ=0;
+float yawOffset   = 0;
 float lastSentBin = NAN;
+bool isCalibrating = false;
 
-// Activity detection
-unsigned long wakeUpTime = 0;
-unsigned long lastActivityTime = 0;
-bool isInActivityCheckMode = false;
-bool wasActive = false;
+// —————— NEW IMU CALIBRATION SYSTEM ——————
+// Calibration strength: 0=disabled, 1=weakest, 255=strongest
+static constexpr const uint8_t IMU_CALIB_STRENGTH = 128;
+static uint8_t imuCalibCountdown = 0;
+static bool imuCalibrationActive = false;
 
-// Display and LED management
-bool screenOn = false;
-unsigned long lastDisplayUpdate = 0;
-unsigned long ledBreathingStartTime = 0;
-bool ledBreathingEnabled = true;
-bool forceDisplayRedraw = false; // Flag to force complete redraw after screen clear
-
-// Configuration constants
-const float POSITION_THRESHOLD_DEGREES = 1.0f;
-const unsigned long ACTIVITY_CHECK_DURATION = 1000; // 1 second to check for activity after wake
-const unsigned long ACTIVITY_TIMEOUT = 120000;
-
-// IMU and motion detection configuration
-const float IMU_LPF_FREQUENCY_HZ = 10.0f;        // IMU low-pass filter frequency (hardware filtering)
-const float MOTION_UPDATE_FREQUENCY_HZ = 10.0f;  // Target frequency for motion/steering updates (software processing)
-const float MIN_UPDATE_INTERVAL_MS = 1000.0f / MOTION_UPDATE_FREQUENCY_HZ; // Minimum time between updates (100ms for 10Hz)
-
-// Display update configuration
-const float DISPLAY_UPDATE_FREQUENCY_HZ = 10.0f; // Display refresh rate (higher = smoother, more CPU)
-const float DISPLAY_UPDATE_INTERVAL_MS = 1000.0f / DISPLAY_UPDATE_FREQUENCY_HZ; // Time between display updates (100ms for 10Hz)
-
-// Note: These frequencies can be set independently for optimal performance:
-// - Higher IMU LPF = more filtering, smoother but less responsive
-// - Higher MOTION_UPDATE = more frequent processing, more CPU but more responsive  
-// - Higher DISPLAY_UPDATE = smoother visual updates, more CPU but better UX
-// - Typically set them equal or IMU LPF slightly higher than MOTION_UPDATE
+// Debug configuration
+const bool DEBUG_MODE = false; // Set to true for verbose debug output
 
 // Yaw drift compensation
-const float yawDriftRate = 0.2f;  // degrees per second drift back to center
-unsigned long lastCenteringTime = 0;
+const float YAW_DRIFT_RATE = 0.2f; // degrees per second drift back to center
+float lastYawTime = 0;      // last time yaw was processed
+float accumulatedYawDrift = 0.0f;
+bool yawDriftEnabled = true; // enable/disable drift compensation
 
-// Display constants
-const int DISPLAY_WIDTH_PORTRAIT = 135;
-const int DISPLAY_HEIGHT_PORTRAIT = 240;
-const int STATUS_BAR_HEIGHT = 20;
-const int BUTTON_HELP_HEIGHT = 25;
+// Gyro drift monitoring - 60-second trailing average
+const int DRIFT_SAMPLES_COUNT = 60; // 60 samples for 60 seconds (1 sample per second)
+float gyroDriftSamples[DRIFT_SAMPLES_COUNT];
+int gyroDriftIndex = 0;
+unsigned long lastDriftSampleTime = 0;
+bool driftArrayFilled = false;
 
-// —————— Utility Functions ——————
+// Gyro filtering
+float gyroFilterAlpha = 0.1f; // Low-pass filter coefficient (0.0 = no filtering, 1.0 = no change)
+float filteredGx = 0, filteredGy = 0, filteredGz = 0;
+
+// Timing for dynamic sample frequency
+float dt, preTime;
+float loopfreq;
+
+// —————— NEW POWER MANAGEMENT SYSTEM ——————
+// Power mode states
+enum PowerMode {
+  POWER_BLE_ACTIVE,    // BLE active, 80MHz CPU, screen on/off based on timer
+  POWER_BLE_WAITING,   // Waiting for BLE connection, 80MHz CPU, reduced activity
+  POWER_LOW_POWER,     // No BLE, 10MHz CPU, IMU/button monitoring only
+  POWER_ULP_SLEEP      // ULP coprocessor monitoring, main CPU off
+};
+PowerMode currentPowerMode = POWER_BLE_WAITING;
+
+// Timing constants
+const unsigned long SCREEN_ON_TIMEOUT = 60000;    // 60 seconds screen on after button
+const unsigned long BLE_WAIT_TIMEOUT = 300000;     // 5 minutes waiting for BLE connection
+const unsigned long LOW_POWER_TIMEOUT = 120000;    // 2 minutes in low power before ULP sleep
+const unsigned long NO_MOTION_TIMEOUT_CONNECTED = 300000; // 5 minutes (300s) of no motion while connected
+// Timer wake removed - only button wake now
+
+// Activity tracking
+unsigned long lastButtonTime = 0;
+unsigned long lastMotionTime = 0;
+unsigned long lastBLEActivityTime = 0;
+bool screenOn = false;
+
+// IMU frequency management
+const float NORMAL_IMU_FREQUENCY = 25.0f;     // 25Hz for normal operation
+const float CALIBRATION_IMU_FREQUENCY = 25.0f; // 25Hz during calibration
+float currentIMUFrequency = NORMAL_IMU_FREQUENCY;
+
+// CPU frequency management
+const int BLE_CPU_FREQ = 80;         // 80MHz minimum for BLE operation
+const int LOW_POWER_CPU_FREQ = 80;   // 80MHz for I2C/IMU/button checks (no BLE)
+const int DEEP_SLEEP_CPU_FREQ = 80;  // 80MHz for ULP wake checks
+
+// LED breathing pattern
+unsigned long ledBreathingStartTime = 0;
+bool ledBreathingEnabled = true;
+
+// Motion detection with noise filtering
+const float MOTION_THRESHOLD = 40.0f; // degrees/second for gyro motion detection (increased for less sensitivity)
+const float ACCEL_MOTION_THRESHOLD = 0.8f; // g-force for accelerometer motion detection (increased for less sensitivity)
+float lastAccelMagnitude = 1.0f; // Initialize to 1g (gravity)
+float lastGyroMagnitude = 0.0f;
+float motionAccumulator = 0.0f;
+unsigned long lastMotionAccumulatorReset = 0;
+
+// Store the last measured raw yaw and timestamp from recentering
+float lastMeasuredRawYaw = 0.0f;
+unsigned long lastYawMeasurementTime = 0;
+bool hasValidYawMeasurement = false;
+
+// ULP coprocessor variables
+RTC_DATA_ATTR int ulp_wake_count = 0;
+RTC_DATA_ATTR int ulp_motion_detected = 0;
+bool ulpProgramLoaded = false;
+unsigned long bleStartTime = 0;
+
+// —————— MODERN DISPLAY SYSTEM ——————
+static LGFX_Sprite displaySprite(&M5.Display);
+static unsigned long lastDisplayUpdate = 0;
+static const unsigned long DISPLAY_UPDATE_INTERVAL = 100; // 10 FPS for smooth updates
+
+// Display state tracking for efficient updates
+static float lastDisplayedYaw = 999.0f;
+static bool lastDisplayedConnected = false;
+static PowerMode lastDisplayedPowerMode = POWER_ULP_SLEEP;
+static float lastDisplayedBattery = 0.0f;
+static bool lastDisplayedMotionActive = false;
+static unsigned long overlayEndTime = 0;
+static String overlayText = "";
+static float smoothedBatteryVoltage = -1.0f; // For battery smoothing
+
+// Helper function to map battery voltage to percentage
+int getBatteryPercentage(float voltage) {
+  // Simple linear mapping from 3.2V (empty) to 4.2V (full)
+  float percentage = (voltage - 3.2f) / (4.2f - 3.2f) * 100.0f;
+  return constrain((int)percentage, 0, 100);
+}
+
+// —————— Utility: 32-bit rotate + hash ——————
 static uint32_t rotate_left32(uint32_t value, uint32_t count) {
   const uint32_t mask = (CHAR_BIT * sizeof(value)) - 1;
   count &= mask;
@@ -118,7 +233,171 @@ static uint32_t hashed(uint64_t seed) {
   return ret ^ edx;
 }
 
-// —————— LED Management ——————
+// —————— Mahony AHRS Functions ——————
+void initMahonyData() {
+  twoKp = twoKpDef;  // 2 * proportional gain (Kp)
+  twoKi = twoKiDef; // 2 * integral gain (Ki)
+  q0 = 1.0f;
+  q1 = 0.0f;
+  q2 = 0.0f;
+  q3 = 0.0f;
+  integralFBx = 0.0f;
+  integralFBy = 0.0f;
+  integralFBz = 0.0f;
+  anglesComputed = 0;
+}
+
+float invSqrt(float x) {
+  float halfx = 0.5f * x;
+  float y = x;
+  long i = *(long*)&y;
+  i = 0x5f3759df - (i>>1);
+  y = *(float*)&i;
+  y = y * (1.5f - (halfx * y * y));
+  y = y * (1.5f - (halfx * y * y));
+  return y;
+}
+
+void MahonyAHRSupdateIMU(float gx, float gy, float gz, float ax, float ay, float az, float samplefrequency) {
+  float recipNorm;
+  float halfvx, halfvy, halfvz;
+  float halfex, halfey, halfez;
+  float qa, qb, qc;
+
+  // Compute feedback only if accelerometer measurement valid (avoids NaN in accelerometer normalisation)
+  if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+
+    // Normalise accelerometer measurement
+    recipNorm = invSqrt(ax * ax + ay * ay + az * az);
+    ax *= recipNorm;
+    ay *= recipNorm;
+    az *= recipNorm;
+
+    // Estimated direction of gravity and vector perpendicular to magnetic flux
+    halfvx = q1 * q3 - q0 * q2;
+    halfvy = q0 * q1 + q2 * q3;
+    halfvz = q0 * q0 - 0.5f + q3 * q3;
+
+    // Error is sum of cross product between estimated and measured direction of gravity
+    halfex = (ay * halfvz - az * halfvy);
+    halfey = (az * halfvx - ax * halfvz);
+    halfez = (ax * halfvy - ay * halfvx);
+
+    // Apply proportional feedback
+    gx += 2.0f * halfex;
+    gy += 2.0f * halfey;
+    gz += 2.0f * halfez;
+  }
+
+  // Integrate rate of change of quaternion
+  gx *= (0.5f * (1.0f / samplefrequency));    // pre-multiply common factors
+  gy *= (0.5f * (1.0f / samplefrequency));
+  gz *= (0.5f * (1.0f / samplefrequency));
+  qa = q0;
+  qb = q1;
+  qc = q2;
+  q0 += (-qb * gx - qc * gy - q3 * gz);
+  q1 += (qa * gx + qc * gz - q3 * gy);
+  q2 += (qa * gy - qb * gz + q3 * gx);
+  q3 += (qa * gz + qb * gy - qc * gx);
+
+  // Normalise quaternion
+  recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  q0 *= recipNorm;
+  q1 *= recipNorm;
+  q2 *= recipNorm;
+  q3 *= recipNorm;
+  anglesComputed = 0;
+}
+
+float getYaw() {
+  // Calculate yaw directly from quaternion components
+  // This is the correct formula for yaw (heading) from quaternion
+  float yaw = atan2f(2.0f * (q1 * q2 + q0 * q3), q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3);
+  
+  // Convert to degrees
+  yaw *= 57.29578f;
+  
+  // Normalize to [-180, 180] range
+  if (yaw > 180) yaw -= 360;
+  else if (yaw < -180) yaw += 360;
+  
+  // Invert yaw direction: clockwise rotation = positive, counter-clockwise = negative
+  return -yaw;
+}
+
+float getRoll() {
+  // Calculate roll directly from quaternion components
+  float roll = atan2f(2.0f * (q0 * q1 + q2 * q3), q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3);
+  return roll * 57.29578f;
+}
+
+float getPitch() {
+  // Calculate pitch directly from quaternion components
+  float pitch = asinf(-2.0f * (q1 * q3 - q0 * q2));
+  return pitch * 57.29578f;
+}
+
+// —————— Power Management Functions ——————
+
+void configurePowerManagement() {
+  Serial.println("Configuring ESP32 power management...");
+  
+  // Configure automatic light sleep with BLE-compatible frequencies
+  esp_pm_config_esp32_t pm_config;
+  pm_config.max_freq_mhz = BLE_CPU_FREQ;  // 80MHz for BLE compatibility
+  pm_config.min_freq_mhz = LOW_POWER_CPU_FREQ; // 10MHz minimum for I2C/GPIO
+  pm_config.light_sleep_enable = true; // Enable automatic light sleep
+  
+  esp_err_t ret = esp_pm_configure(&pm_config);
+  if (ret == ESP_OK) {
+    Serial.println("Power management configured successfully");
+  } else {
+    Serial.printf("Power management configuration failed: %d\n", ret);
+  }
+  
+  Serial.println("Power management configured for BLE compatibility");
+}
+
+void setupULPProgram() {
+  Serial.println("Setting up ULP coprocessor program...");
+  
+  // Configure RTC GPIO for button wake-up only
+  // M5StickCPlus2 buttons are active LOW (normally HIGH, go LOW when pressed)
+  
+  rtc_gpio_init(GPIO_NUM_37); // Button A
+  rtc_gpio_set_direction(GPIO_NUM_37, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pullup_en(GPIO_NUM_37);
+  rtc_gpio_pulldown_dis(GPIO_NUM_37);
+  
+  rtc_gpio_init(GPIO_NUM_39); // Button B
+  rtc_gpio_set_direction(GPIO_NUM_39, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pullup_en(GPIO_NUM_39);
+  rtc_gpio_pulldown_dis(GPIO_NUM_39);
+  
+  rtc_gpio_init(GPIO_NUM_35); // Button C
+  rtc_gpio_set_direction(GPIO_NUM_35, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pullup_en(GPIO_NUM_35);
+  rtc_gpio_pulldown_dis(GPIO_NUM_35);
+  
+  // Enable wake on Button A (ext0) and Button C (ext1)
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_37, 0); // Button A: wake on LOW (button press)
+  
+  // Configure ext1 for Button A wake-up
+  uint64_t ext1_mask = (1ULL << GPIO_NUM_37); // Button A only
+  esp_sleep_enable_ext1_wakeup(ext1_mask, ESP_EXT1_WAKEUP_ALL_LOW); // Wake on Button A LOW
+  
+  ulpProgramLoaded = true;
+  Serial.println("ULP program configured with button-only wake sources");
+}
+
+void setupIMUWakeup() {
+  // For M5StickCPlus2, we'll use the ULP coprocessor approach
+  // The ULP can periodically wake the main CPU to check IMU
+  setupULPProgram();
+  Serial.println("IMU wake-on-motion configured via ULP coprocessor");
+}
+
 void updateLEDBreathing() {
   if (!ledBreathingEnabled) {
     ledcWrite(0, 0); // Turn off LED
@@ -129,22 +408,27 @@ void updateLEDBreathing() {
   
   // Different breathing patterns based on connection state
   float breathingPeriod;
-  float maxBrightness = 25.5f; // 10% of 255 (10% brightness)
+  float maxBrightness = 12.75f; // 5% of 255 (5% brightness)
   
   if (deviceConnected) {
-    breathingPeriod = 1500.0f; // 1.5 second breathing when connected (faster)
+    // Quick flash every 1 second when connected
+    if ((currentTime % 1000) < 100) { // On for 100ms
+      ledcWrite(0, (int)maxBrightness);
+    } else {
+      ledcWrite(0, 0); // Off for 900ms
+    }
   } else {
-    breathingPeriod = 3000.0f; // 3 second breathing when advertising (slower)
+    breathingPeriod = 3000.0f; // 3 second breathing when not connected
+    
+    // Calculate breathing phase (0.0 to 1.0)
+    float phase = fmod((currentTime - ledBreathingStartTime), breathingPeriod) / breathingPeriod;
+    
+    // Create smooth breathing pattern using sine wave
+    float brightness = (sin(phase * 2.0f * PI - PI/2.0f) + 1.0f) / 2.0f; // 0.0 to 1.0
+    brightness = brightness * maxBrightness; // Scale to max brightness
+    
+    ledcWrite(0, (int)brightness);
   }
-  
-  // Calculate breathing phase (0.0 to 1.0)
-  float phase = fmod((currentTime - ledBreathingStartTime), breathingPeriod) / breathingPeriod;
-  
-  // Create smooth breathing pattern using sine wave
-  float brightness = (sin(phase * 2.0f * PI - PI/2.0f) + 1.0f) / 2.0f; // 0.0 to 1.0
-  brightness = brightness * maxBrightness; // Scale to max brightness
-  
-  ledcWrite(0, (int)brightness);
 }
 
 void wakePulse() {
@@ -154,397 +438,742 @@ void wakePulse() {
   ledcWrite(0, 0);  // Turn off
 }
 
-// —————— Forward Declarations ——————
-float getYaw();
+// —————— INACTIVITY COUNTDOWN LOGGING ——————
 
-// —————— Display Management ——————
-void initializeDisplay() {
-  M5.Display.setRotation(0);  // Portrait mode
-  M5.Display.setTextColor(WHITE);
-  M5.Display.setTextDatum(0);
-  M5.Display.setFont(&fonts::Font0);
-  M5.Display.setTextSize(2);
-  M5.Display.setBrightness(13); // 5% brightness (13/255 ≈ 5%)
-  screenOn = true;
-  Serial.println("Display initialized at 5% brightness");
+void logInactivityStatus() {
+  static unsigned long lastLogTime = 0;
+  static unsigned long lastActivityTime = 0;
+  static const char* lastActivityType = "none";
+  
+  unsigned long currentTime = millis();
+  
+  // Only log every 10 seconds to avoid spam
+  if (currentTime - lastLogTime < 10000) {
+    return;
+  }
+  
+  // Check for new activity
+  bool newActivity = false;
+  const char* activityType = "none";
+  
+  // Check button activity
+  if (currentTime - lastButtonTime < 5000) { // Recent button press
+    if (currentTime - lastButtonTime < 1000) { // Very recent
+      newActivity = true;
+      activityType = "button_press";
+    }
+  }
+  
+  // Check Zwift connection
+  if (zwiftConnected) {
+    newActivity = true;
+    activityType = "zwift_connected";
+  }
+  
+  // Check motion activity
+  if (currentTime - lastMotionTime < 5000) { // Recent motion
+    newActivity = true;
+    activityType = "motion_detected";
+  }
+  
+  // Update activity tracking
+  if (newActivity && strcmp(activityType, lastActivityType) != 0) {
+    Serial.printf("ACTIVITY: %s detected - resetting timers\n", activityType);
+    lastActivityType = activityType;
+    lastActivityTime = currentTime;
+  }
+  
+  // Calculate countdowns
+  unsigned long timeSinceButton = currentTime - lastButtonTime;
+  unsigned long timeSinceMotion = currentTime - lastMotionTime;
+  unsigned long timeSinceBLEStart = currentTime - bleStartTime;
+  
+  // Screen off countdown
+  unsigned long screenOffCountdown = 0;
+  if (screenOn) {
+    if (timeSinceButton <= SCREEN_ON_TIMEOUT) {
+      screenOffCountdown = (SCREEN_ON_TIMEOUT - timeSinceButton) / 1000;
+    } else if (zwiftConnected) {
+      screenOffCountdown = 999; // Indefinite
+    } else if (timeSinceMotion <= 30000) {
+      screenOffCountdown = (30000 - timeSinceMotion) / 1000;
+    } else {
+      screenOffCountdown = 0; // Should be off
+    }
+  }
+  
+  // Deep sleep countdown
+  unsigned long sleepCountdown = 0;
+  switch (currentPowerMode) {
+    case POWER_BLE_WAITING:
+      if (timeSinceBLEStart > BLE_WAIT_TIMEOUT) {
+        sleepCountdown = 0; // Should be in low power
+      } else {
+        sleepCountdown = (BLE_WAIT_TIMEOUT - timeSinceBLEStart) / 1000;
+      }
+      break;
+    case POWER_LOW_POWER:
+      {
+        unsigned long timeSinceActivity = min(timeSinceMotion, timeSinceButton);
+        if (timeSinceActivity > LOW_POWER_TIMEOUT) {
+          sleepCountdown = 0; // Should be sleeping
+        } else {
+          sleepCountdown = (LOW_POWER_TIMEOUT - timeSinceActivity) / 1000;
+        }
+      }
+      break;
+    case POWER_BLE_ACTIVE:
+      sleepCountdown = 999; // No sleep when connected
+      break;
+    default:
+      sleepCountdown = 0;
+      break;
+  }
+  
+  // Store status for consolidated logging (will be printed elsewhere)
+  // Serial.printf("INACTIVITY: Screen=%ds Sleep=%ds BLE=%s Motion=%s Zwift=%s\n",
+  //               screenOffCountdown, sleepCountdown,
+  //               deviceConnected ? "connected" : "waiting",
+  //               (currentTime - lastMotionTime < 5000) ? "active" : "idle",
+  //               zwiftConnected ? "active" : "idle");
+  
+  lastLogTime = currentTime;
 }
 
-void clearDisplaySafe() {
+// —————— MODERN DISPLAY FUNCTIONS ——————
+
+void initializeDisplayBuffer() {
+  // Create the sprite for double-buffering
+  displaySprite.setColorDepth(8); // 8-bit color for performance
+  displaySprite.createSprite(M5.Display.width(), M5.Display.height());
+  displaySprite.setPaletteColor(1, TFT_WHITE);
+  displaySprite.setPaletteColor(2, TFT_GREEN);
+  displaySprite.setPaletteColor(3, TFT_RED);
+  displaySprite.setPaletteColor(4, 0x39E7); // A nice blue for the background
+}
+
+void showOverlay(String text, int duration_ms) {
+  overlayText = text;
+  overlayEndTime = millis() + duration_ms;
+}
+
+// Splash overlay display for startup/wake with configurable top text, center image, and bottom text
+void showSplashOverlay(String topText = "", String imagePath = "", String bottomText = "", int duration_ms = 2000) {
+  if (!screenOn) {
+    M5.Display.wakeup();
+    M5.Display.setBrightness(13);
+  }
+  
+  // Clear and setup display
   M5.Display.clear();
-  M5.Display.setTextColor(WHITE); // Reset to default color
-}
-
-void drawCenteredText(const char* text, int y, int textSize = 2, uint16_t color = WHITE) {
-  M5.Display.setTextSize(textSize);
-  M5.Display.setTextColor(color);
-  
-  // Calculate text width for centering
-  int textWidth = strlen(text) * 6 * textSize; // Approximate character width
-  int x = (DISPLAY_WIDTH_PORTRAIT - textWidth) / 2;
-  if (x < 0) x = 2; // Minimum margin
-  
-  M5.Display.setCursor(x, y);
-  M5.Display.print(text);
-}
-
-void drawStatusBar() {
-  // Draw status bar background
-  M5.Display.fillRect(0, 0, DISPLAY_WIDTH_PORTRAIT, STATUS_BAR_HEIGHT, 0x2104); // Dark gray
-  
-  // Battery voltage (right side)
-  float batteryVoltage = M5.Power.getBatteryVoltage() / 1000.0f;
-  M5.Display.setTextSize(1.5);
+  M5.Display.setRotation(0);
   M5.Display.setTextColor(WHITE);
-  M5.Display.setCursor(DISPLAY_WIDTH_PORTRAIT - 45, 5);
-  M5.Display.printf("%.2fV", batteryVoltage);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextDatum(MC_DATUM);
   
-  // Connection status (left side)
-  M5.Display.setCursor(2, 5);
-  if (deviceConnected) {
-    M5.Display.setTextColor(0x07E0); // Green
-    M5.Display.print("BLE");
+  int screenCenterX = M5.Display.width() / 2;
+  int screenHeight = M5.Display.height();
+  
+  // Display top text (center-top justified)
+  if (topText.length() > 0) {
+    M5.Display.setTextDatum(TC_DATUM); // Top-Center
+    M5.Display.drawString(topText, screenCenterX, 10);
+  }
+  
+  // Display center image from LittleFS
+  if (imagePath.length() > 0) {
+    String fullPath = "/" + imagePath;
+    if (LittleFS.exists(fullPath)) {
+      // M5StickC Plus2 display has non-square pixels:
+      // Pixel width: 0.1101 mm, Pixel height: 0.1038 mm
+      // Aspect ratio: 1.061 (pixels are wider than tall)
+      // To display a square image correctly, we need to stretch vertically by this ratio
+      
+      int imageSize = 135; // Original square image size
+      int imageX = screenCenterX - (imageSize / 2);
+      int imageY = (screenHeight / 2) - (imageSize / 2);
+      
+      // Draw the image with aspect ratio correction using scale_x and scale_y
+      // scale_x = 1.0 (no horizontal scaling)
+      // scale_y = 1.061 (stretch vertically to compensate for non-square pixels)
+      M5.Display.drawJpgFile(LittleFS, fullPath.c_str(), imageX, imageY, 0, 0, 0, 0, 1.0f, 1.061f);
+    } else {
+      // If image doesn't exist, show placeholder text
+      M5.Display.setTextDatum(MC_DATUM); // Middle-Center
+      M5.Display.setTextSize(1);
+      M5.Display.drawString("Image not found:", screenCenterX, screenHeight / 2 - 10);
+      M5.Display.drawString(imagePath, screenCenterX, screenHeight / 2 + 10);
+      M5.Display.setTextSize(2); // Reset text size
+    }
+  }
+  
+  // Display bottom text (center-bottom justified)
+  if (bottomText.length() > 0) {
+    M5.Display.setTextDatum(BC_DATUM); // Bottom-Center
+    M5.Display.drawString(bottomText, screenCenterX, screenHeight - 10);
+  }
+  
+  if (duration_ms > 0) {
+    delay(duration_ms);
+  }
+}
+
+void clearOverlay() {
+  overlayEndTime = 0;
+  overlayText = "";
+}
+
+void drawModernDisplay(float yaw, bool connected, PowerMode powerMode, float battery, int freq) {
+  // Update at consistent 10 FPS when screen is on
+  if (!screenOn) {
+    return;
+  }
+  
+  if (millis() - lastDisplayUpdate < DISPLAY_UPDATE_INTERVAL) {
+    return;
+  }
+  
+  int yawInt = round(yaw);
+  
+  // Smooth battery voltage reading
+  if (smoothedBatteryVoltage < 0) {
+    smoothedBatteryVoltage = battery;
   } else {
-    M5.Display.setTextColor(0xFBE0); // Yellow
-    M5.Display.print("ADV");
+    smoothedBatteryVoltage = smoothedBatteryVoltage * 0.9f + battery * 0.1f;
   }
-  
-  // Wake count (center)
-  M5.Display.setTextColor(WHITE);
-  M5.Display.setCursor(DISPLAY_WIDTH_PORTRAIT/2 - 30, 5);
-  M5.Display.printf("W:%d", wakeCount);
-}
+  int batteryPercentage = getBatteryPercentage(smoothedBatteryVoltage);
 
-void showButtonHelp() {
-  int helpY = DISPLAY_HEIGHT_PORTRAIT - BUTTON_HELP_HEIGHT;
-  
-  // Draw help background
-  M5.Display.fillRect(0, helpY, DISPLAY_WIDTH_PORTRAIT, BUTTON_HELP_HEIGHT, 0x1082); // Very dark gray
-  
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(0xC618); // Light gray
-  
-    // Portrait layout - compact button help
-    M5.Display.setCursor(2, helpY + 5);
-    M5.Display.print("A/B:Recenter C:Screen");
-    M5.Display.setCursor(2, helpY + 15);
-    M5.Display.print("Hold A/B:Cal Hold C:Off");
-}
+  bool motionIsActive = (millis() - lastMotionTime <= 30000);
 
-void updateMainDisplay() {
-  if (!screenOn) return;
+  // Check overlay status and detect when it just expired
+  bool overlayActive = (millis() < overlayEndTime);
+  static bool lastOverlayActive = false;
+  bool overlayJustExpired = (lastOverlayActive && !overlayActive);
   
-  // Update at configurable frequency for smooth display
-  if (millis() - lastDisplayUpdate < DISPLAY_UPDATE_INTERVAL_MS) return;
-  lastDisplayUpdate = millis();
-  
-  // Static variables to track previous values for selective updates
-  static bool firstRun = true;
-  static char prevYawText[20] = "";
-  static char prevBinText[20] = "";
-  static bool prevConnected = false;
-  static float prevBatteryVoltage = 0;
-  static unsigned long prevTimeUntilSleep = 0;
-  static bool prevActivityCheckMode = false;
-  static uint16_t prevActivityColor = WHITE;
-  static char prevActivityText[30] = "";
-  static int prevActivityState = -1;
-  
-  // Check if we need to force a full redraw
-  if (forceDisplayRedraw) {
-    firstRun = true;
-    forceDisplayRedraw = false;
-    // Reset all cached values to force updates
-    strcpy(prevYawText, "");
-    strcpy(prevBinText, "");
-    prevConnected = !deviceConnected; // Force connection status update
-    prevBatteryVoltage = 0;
-    prevTimeUntilSleep = 0;
-    prevActivityCheckMode = !isInActivityCheckMode;
-    prevActivityColor = WHITE;
-    strcpy(prevActivityText, "");
-    prevActivityState = -1;
+  // Check if anything has changed to avoid unnecessary redraws
+  bool needsUpdate = false;
+  if (abs(yawInt - round(lastDisplayedYaw)) > 0 ||
+      connected != lastDisplayedConnected ||
+      powerMode != lastDisplayedPowerMode ||
+      motionIsActive != lastDisplayedMotionActive ||
+      abs(batteryPercentage - round(lastDisplayedBattery)) > 0 ||
+      overlayActive ||          // Update when overlay is active
+      overlayJustExpired) {     // Update when overlay just expired (to clear it)
+    needsUpdate = true;
   }
   
-  // Calculate current values
-    float rawYaw = getYaw();
-    float rel = rawYaw + yawOffset;
+  // Update overlay state tracking
+  lastOverlayActive = overlayActive;
   
-  // Normalize to [-180, 180]
-    while (rel > 180) rel -= 360;
-    while (rel < -180) rel += 360;
-    
-    float unclamped_rel = rel;
-    rel = constrain(rel, -40, 40);
-    float bin = round(rel/1.0f)*1.0f;
-    if (abs(bin) < 0.1f) bin = 0.0f;
-    
-  char yawText[20];
-  char binText[20];
-  bool flashOn = (millis() / 500) % 2 == 0; // Flash every 500ms for smoother animation
-    if (unclamped_rel >= 40.0f) {
-    snprintf(yawText, sizeof(yawText), "%.1f%s", rel, flashOn ? ">" : "");
-    } else if (unclamped_rel <= -40.0f) {
-    snprintf(yawText, sizeof(yawText), "%.1f%s", rel, flashOn ? "<" : "");
-    } else {
-    snprintf(yawText, sizeof(yawText), "%.1f", rel);
+  if (!needsUpdate) {
+    return;
   }
-  snprintf(binText, sizeof(binText), "%.0f", bin);
-  
-  // Layout constants
-  int contentStartY = STATUS_BAR_HEIGHT + 10;
-  int boxY = contentStartY + 30;
-  int boxHeight = 50;
-  int boxWidth = 60;
-  int leftBoxX = 10;
-  int rightBoxX = DISPLAY_WIDTH_PORTRAIT - boxWidth - 10;
-  
-  // First run - draw everything
-  if (firstRun) {
-    clearDisplaySafe();
-    
-    // Draw static elements that rarely change
-    drawCenteredText("ZTEERSTICK", contentStartY, 2, ORANGE);
-    
-    // Draw boxes and divider for Yaw and Bin
-    M5.Display.drawRect(leftBoxX, boxY, boxWidth, boxHeight, WHITE);
-    M5.Display.drawRect(rightBoxX, boxY, boxWidth, boxHeight, CYAN);
-    int centerX = DISPLAY_WIDTH_PORTRAIT / 2;
-    M5.Display.drawLine(centerX, boxY, centerX, boxY + boxHeight, WHITE);
-    
-    // Draw box labels
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(WHITE);
-    M5.Display.setCursor(leftBoxX + (boxWidth - 18) / 2, boxY + 5);
-    M5.Display.print("YAW");
-    
-    M5.Display.setTextColor(CYAN);
-    M5.Display.setCursor(rightBoxX + (boxWidth - 18) / 2, boxY + 5);
-    M5.Display.print("BIN");
-    
-    showButtonHelp(); // Static button help
-    firstRun = false;
-  }
-  
-  // Selective updates - only redraw what changed
-  
-  // 1. Update Yaw value if changed
-  if (strcmp(yawText, prevYawText) != 0) {
-    // Clear yaw value area
-    M5.Display.fillRect(leftBoxX + 1, boxY + 20, boxWidth - 6, 25, BLACK);
-    
-    // Draw new yaw value
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(WHITE);
-    int yawValueWidth = strlen(yawText) * 12;
-    int yawValueX = leftBoxX + (boxWidth - yawValueWidth) / 2;
-    M5.Display.setCursor(yawValueX, boxY + 25);
-    M5.Display.print(yawText);
-    
-    strcpy(prevYawText, yawText);
-  }
-  
-  // 2. Update Bin value if changed
-  if (strcmp(binText, prevBinText) != 0) {
-    // Clear bin value area
-    M5.Display.fillRect(rightBoxX + 5, boxY + 20, boxWidth - 6, 25, BLACK);
-    
-    // Draw new bin value
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(CYAN);
-    int binValueWidth = strlen(binText) * 12;
-    int binValueX = rightBoxX + (boxWidth - binValueWidth) / 2;
-    M5.Display.setCursor(binValueX, boxY + 25);
-    M5.Display.print(binText);
-    
-    strcpy(prevBinText, binText);
-  }
-  
-  // 3. Update status bar if battery or connection changed
-  float batteryVoltage = M5.Power.getBatteryVoltage() / 1000.0f;
-  if (abs(batteryVoltage - prevBatteryVoltage) > 0.01f || deviceConnected != prevConnected) {
-    drawStatusBar();
-    prevBatteryVoltage = batteryVoltage;
-    prevConnected = deviceConnected;
-  }
-  
-  // 4. Update connection status if changed
-  if (deviceConnected != prevConnected) {
-    // Clear connection status area
-    M5.Display.fillRect(10, contentStartY + 95, DISPLAY_WIDTH_PORTRAIT - 20, 15, BLACK);
-    
-    // Draw new connection status
-    M5.Display.setTextSize(1.5);
-    M5.Display.setCursor(10, contentStartY + 95);
-    if (deviceConnected) {
-      M5.Display.setTextColor(GREEN);
-      M5.Display.print("ZWIFTING!!!");
-    } else {
-      M5.Display.setTextColor(YELLOW);
-      M5.Display.print("READY TO ROLL");
-    }
-  }
-  
-  // 5. Update activity status (check every update for smooth transitions)
-  char activityText[30];
-  uint16_t activityColor;
-  int currentActivityState = 0; // 0=active, 1=idle, 2=sleep countdown, 3=checking
-  
-  if (isInActivityCheckMode) {
-    strcpy(activityText, "Checking position...");
-    activityColor = TFT_LIGHTGREY;
-    currentActivityState = 3;
-  } else {
-    unsigned long timeSinceActivity = millis() - lastActivityTime;
-    unsigned long timeUntilSleep = (ACTIVITY_TIMEOUT - timeSinceActivity) / 1000;
-    
-    if (timeSinceActivity < 5000) {
-      strcpy(activityText, "A");
-      activityColor = GREEN;
-      currentActivityState = 0;
-      // Ensure screen is at normal brightness when active
-      if (M5.Display.getBrightness() != 13) {
-        M5.Display.setBrightness(13); // 5% brightness
-      }
-    } else if (timeSinceActivity < 30000) {
-      strcpy(activityText, "I");
-      activityColor = YELLOW;
-      currentActivityState = 1;
-      // Dim screen to 1% when idle
-      if (M5.Display.getBrightness() != 1) {
-        M5.Display.setBrightness(1); // 1% brightness
-      }
-    } else {
-      snprintf(activityText, sizeof(activityText), "Zzzz:%lus", timeUntilSleep);
-      activityColor = TFT_LIGHTGREY;
-      currentActivityState = 2;
-      // Keep screen dimmed when approaching sleep
-      if (M5.Display.getBrightness() != 1) {
-        M5.Display.setBrightness(1); // 1% brightness
-      }
-    }
-  }
-  
-  // Check for major activity state transitions that require full redraw
-  bool majorStateTransition = false;
-  if (prevActivityState != -1 && prevActivityState != currentActivityState) {
-    // Detect transitions that involve significant brightness changes
-    if ((prevActivityState == 2 && currentActivityState == 0) ||  // Sleep countdown -> Active
-        (prevActivityState == 1 && currentActivityState == 0) ||  // Idle -> Active  
-        (prevActivityState == 0 && currentActivityState == 1) ||  // Active -> Idle
-        (prevActivityState == 0 && currentActivityState == 2)) {  // Active -> Sleep countdown
-      majorStateTransition = true;
-      Serial.printf("Major activity state transition: %d -> %d, forcing redraw\n", prevActivityState, currentActivityState);
-    }
-  }
-  
-  // Force redraw on major transitions
-  if (majorStateTransition && !firstRun) {
-    firstRun = true;
-    // Reset all cached values to force updates
-    strcpy(prevYawText, "");
-    strcpy(prevBinText, "");
-    prevConnected = !deviceConnected;
-    prevBatteryVoltage = 0;
-    prevTimeUntilSleep = 0;
-    prevActivityCheckMode = !isInActivityCheckMode;
-    prevActivityColor = WHITE;
-    strcpy(prevActivityText, "");
-    prevActivityState = -1;
-  }
-  
-  // Only update activity status if it changed
-  if (strcmp(activityText, prevActivityText) != 0 || activityColor != prevActivityColor || 
-      isInActivityCheckMode != prevActivityCheckMode || majorStateTransition) {
-    // Clear activity status area
-    M5.Display.fillRect(10, contentStartY + 170, DISPLAY_WIDTH_PORTRAIT - 20, 15, BLACK);
-    
-    // Draw new activity status
-    M5.Display.setTextSize(1.5);
-    M5.Display.setTextColor(activityColor);
-    M5.Display.setCursor(10, contentStartY + 170);
-    M5.Display.print(activityText);
-    
-    strcpy(prevActivityText, activityText);
-    prevActivityColor = activityColor;
-    prevActivityCheckMode = isInActivityCheckMode;
-    prevActivityState = currentActivityState;
-  }
-  
-  M5.Display.display();
-}
 
-void showStatusMessage(const char* title, const char* message, uint16_t color = WHITE, int duration = 2000) {
-  if (!screenOn) return;
+  // --- Start Drawing to Off-Screen Buffer ---
   
-  clearDisplaySafe();
-  
-  int centerY = DISPLAY_HEIGHT_PORTRAIT / 2;
-  
-  drawCenteredText(title, centerY - 20, 2.5, color);
-  drawCenteredText(message, centerY + 10, 2, WHITE);
-  
-  M5.Display.display();
-  delay(duration);
-  
-  // Force a complete redraw of the main display after clearing the screen
-  forceDisplayRedraw = true;
-  
-  Serial.printf("Status message: %s - %s\n", title, message);
-}
+  displaySprite.fillSprite(TFT_BLACK); // Clear background
 
-void showConnectionScreen(bool connected) {
-  if (!screenOn) return;
-  
-  clearDisplaySafe();
-  
-  int centerY = DISPLAY_HEIGHT_PORTRAIT / 2;
-  
+  // Header - Row 1: Title
+  displaySprite.setTextColor(TFT_WHITE);
+  displaySprite.setTextDatum(TC_DATUM); // Top-Center
+  displaySprite.setFont(&fonts::Font2);
+  displaySprite.drawString("ZTEERStick", displaySprite.width()/2, 3);
+
+  // Header - Row 2: Status Icons
+  displaySprite.setTextDatum(TL_DATUM); // Top-Left
+  displaySprite.setFont(&fonts::Font2);
+  // BLE Status
   if (connected) {
-    drawCenteredText("BLE", centerY - 20, 2, GREEN);
-    drawCenteredText("CONNECTED", centerY + 10, 2, GREEN);
-    drawCenteredText("Faster LED pulse", centerY + 40, 1, WHITE);
+    displaySprite.setTextColor(TFT_GREEN);
+    displaySprite.drawString("BLE", 8, 22); 
   } else {
-    drawCenteredText("BLE", centerY - 20, 2, RED);
-    drawCenteredText("DISCONNECTED", centerY + 10, 2, RED);
-    drawCenteredText("Slower LED pulse", centerY + 40, 1, WHITE);
+    displaySprite.setTextColor(TFT_RED);
+    displaySprite.drawString("BLE", 8, 22);
+  }
+
+  // --- Battery Icon and Percentage ---
+  displaySprite.setTextDatum(TR_DATUM); // Top-Right
+  displaySprite.setTextColor(TFT_WHITE);
+  String battStr = String(batteryPercentage) + "%";
+  displaySprite.drawString(battStr, 110, 22);
+  
+  // Draw battery icon outline
+  displaySprite.drawRect(115, 20, 18, 10, TFT_WHITE);
+  displaySprite.fillRect(133, 23, 2, 4, TFT_WHITE);
+
+  // Draw battery level
+  int batteryLevelWidth = map(batteryPercentage, 0, 100, 0, 14);
+  displaySprite.fillRect(117, 22, batteryLevelWidth, 6, (batteryPercentage < 20) ? TFT_RED : TFT_GREEN);
+
+  // Main Yaw Value
+  displaySprite.setFont(&fonts::Font7);
+  displaySprite.setTextDatum(MC_DATUM); // Middle-Center
+
+  // Custom centering for sign
+  String yawNumStr = String(abs(yawInt));
+  int textWidth = displaySprite.textWidth(yawNumStr);
+  int signWidth = displaySprite.textWidth("-");
+  int x_center = M5.Display.width() / 2;
+  int x_pos_num = x_center + (yawInt < 0 ? signWidth / 2 : 0);
+
+  bool atLimit = (yawInt < -39 || yawInt > 39);
+  bool flashOn = (millis() / 500) % 2 == 0;
+  
+  if (atLimit && flashOn) {
+      displaySprite.setTextColor(TFT_RED);
+  } else {
+      displaySprite.setTextColor(TFT_WHITE);
+  }
+
+  displaySprite.drawString(yawNumStr, x_pos_num, M5.Display.height() / 2);
+  if (yawInt < 0) {
+      displaySprite.drawString("-", x_pos_num - textWidth/2 - signWidth/2, M5.Display.height() / 2);
+  }
+
+  // --- Steering Gauge ---
+  int gaugeWidth = 100;
+  int gaugeX = (displaySprite.width() - gaugeWidth) / 2;
+  int gaugeY = M5.Display.height() - 40;
+  displaySprite.drawRect(gaugeX, gaugeY, gaugeWidth, 10, TFT_WHITE); // Outline
+  
+  // Calculate center position and indicator position
+  int centerX = gaugeX + gaugeWidth / 2;
+  int indicatorPos = map(yawInt, -40, 40, 0, gaugeWidth - 4);
+  int indicatorX = gaugeX + 2 + indicatorPos;
+  
+  // Fill from center to indicator position
+  if (yawInt != 0) {
+    int fillStart, fillWidth;
+    uint16_t fillColor;
+    
+    if (yawInt > 0) { // Right turn (positive yaw)
+      fillStart = centerX;
+      fillWidth = indicatorX - centerX;
+      fillColor = TFT_BLUE; // Blue  for right
+    } else { // Left turn (negative yaw)
+      fillStart = indicatorX;
+      fillWidth = centerX - indicatorX;
+      fillColor = TFT_ORANGE; // Orange for left
+    }
+    
+    // Only fill if there's actual width to fill
+    if (fillWidth > 0) {
+      displaySprite.fillRect(fillStart, gaugeY + 2, fillWidth, 6, fillColor);
+    }
   }
   
-  M5.Display.display();
-  delay(3000);
+  // Center line (draw after fill so it's always visible)
+  displaySprite.drawFastVLine(centerX, gaugeY, 10, TFT_WHITE);
+
+  // Footer
+  displaySprite.setTextDatum(BC_DATUM); // Bottom-Center
+  displaySprite.setFont(&fonts::Font2);
+  displaySprite.setTextColor(TFT_WHITE);
+  
+  String powerStatus = "";
+   if (zwiftConnected) {
+    powerStatus = "CONNECTED";
+  } else if (motionIsActive) {
+    powerStatus = "ACTIVE";
+  } else {
+      switch(powerMode) {
+          case POWER_BLE_ACTIVE: powerStatus = "CONNECTED"; break;
+          case POWER_BLE_WAITING: powerStatus = "WAITING"; break;
+          case POWER_LOW_POWER: powerStatus = "STANDBY"; break;
+          default: powerStatus = "STANDBY"; break;
+      }
+  }
+  displaySprite.drawString(powerStatus, x_center, M5.Display.height() - 8);
+
+  // --- Draw Overlay if active ---
+  if (millis() < overlayEndTime) {
+    // Adjust overlay size based on text length for better readability
+    int overlayWidth = max(80, min(120, (int)(overlayText.length() * 8 + 20)));
+    int overlayX = (displaySprite.width() - overlayWidth) / 2;
+    
+    displaySprite.fillRoundRect(overlayX, 40, overlayWidth, 40, 8, TFT_DARKGREY);
+    displaySprite.drawRoundRect(overlayX, 40, overlayWidth, 40, 8, TFT_WHITE); // Add border
+    displaySprite.setTextDatum(MC_DATUM);
+    displaySprite.setFont(&fonts::Font2);
+    displaySprite.setTextColor(TFT_WHITE);
+    displaySprite.drawString(overlayText, displaySprite.width() / 2, 60);
+  }
+
+  // --- Push Buffer to Screen ---
+  displaySprite.pushSprite(0, 0);
+
+  // Update tracking variables
+  lastDisplayedYaw = yaw;
+  lastDisplayedConnected = connected;
+  lastDisplayedPowerMode = powerMode;
+  lastDisplayedBattery = batteryPercentage;
+  lastDisplayedMotionActive = motionIsActive;
+  lastDisplayUpdate = millis();
 }
 
-void turnOnScreen() {
+bool detectMotion(float gx, float gy, float gz, float ax, float ay, float az) {
+  // Calculate gyro magnitude (degrees/second)
+  float gyroMagnitude = sqrt(gx*gx + gy*gy + gz*gz);
+  
+  // Calculate accelerometer magnitude (g-force)
+  float accelMagnitude = sqrt(ax*ax + ay*ay + az*az);
+  float accelDelta = abs(accelMagnitude - lastAccelMagnitude);
+  
+  // Calculate motion deltas with noise filtering
+  float gyroDelta = abs(gyroMagnitude - lastGyroMagnitude);
+  
+  // Apply deadzone/noise filtering
+  bool gyroMotion = gyroDelta > MOTION_THRESHOLD;
+  bool accelMotion = accelDelta > ACCEL_MOTION_THRESHOLD;
+
+  if (gyroMotion) {
+    Serial.printf("MOTION: Gyroscope event. Value: %.2f dps > Threshold: %.2f dps\n", gyroDelta, MOTION_THRESHOLD);
+  }
+  if (accelMotion) {
+    Serial.printf("MOTION: Accelerometer event. Value: %.2f g > Threshold: %.2f g\n", accelDelta, ACCEL_MOTION_THRESHOLD);
+  }
+  
+  // Update last values with filtering
+  float alpha = 0.7f;
+  lastGyroMagnitude = alpha * lastGyroMagnitude + (1.0f - alpha) * gyroMagnitude;
+  lastAccelMagnitude = alpha * lastAccelMagnitude + (1.0f - alpha) * accelMagnitude;
+  
+  // Accumulate significant motion for deep sleep decisions
+  if (gyroMotion || accelMotion) {
+    motionAccumulator += gyroDelta + (accelDelta * 5.0f);
+  }
+  
+  // Reset accumulator every 30 seconds
+  unsigned long currentTime = millis();
+  if (currentTime - lastMotionAccumulatorReset > 30000) {
+    motionAccumulator = 0;
+    lastMotionAccumulatorReset = currentTime;
+  }
+  
+  return gyroMotion || accelMotion;
+}
+
+bool hasSignificantAccumulatedMotion() {
+  return motionAccumulator > 3.0f; // Threshold for significant movement
+}
+
+void startBLE() {
+  Serial.println("Starting BLE...");
+  
+  // Configure BLE for low power
+  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  bt_cfg.mode = ESP_BT_MODE_BLE; // BLE only mode
+  esp_bt_controller_init(&bt_cfg);
+  esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  
+  // Ensure CPU is at 80MHz for BLE
+  setCpuFrequencyMhz(BLE_CPU_FREQ);
+  
+  Serial.println("BLE started, CPU at 80MHz");
+}
+
+void stopBLE() {
+  Serial.println("Stopping BLE to save power...");
+  
+  // Stop BLE advertising and disable controller
+  BLEDevice::deinit(false);
+  esp_bt_controller_disable();
+  esp_bt_controller_deinit();
+  
+  Serial.println("BLE stopped");
+}
+
+void enterBLEWaitingMode() {
+  if (currentPowerMode != POWER_BLE_WAITING) {
+    Serial.println("Entering BLE waiting mode");
+    
+    // Ensure BLE is running and CPU at 80MHz
+    startBLE();
+    setCpuFrequencyMhz(BLE_CPU_FREQ);
+    
+    // Turn off screen to save power while waiting
+    if (screenOn) {
+      M5.Display.clear();
+      M5.Display.sleep();
+      screenOn = false;
+    }
+    
+    currentPowerMode = POWER_BLE_WAITING;
+    bleStartTime = millis();
+    
+    Serial.printf("BLE waiting mode - CPU: %d MHz, Screen: OFF\n", BLE_CPU_FREQ);
+  }
+}
+
+void enterBLEActiveMode() {
+  if (currentPowerMode != POWER_BLE_ACTIVE) {
+    Serial.println("Entering BLE active mode");
+    
+    // Ensure CPU at 80MHz for BLE
+    setCpuFrequencyMhz(BLE_CPU_FREQ);
+    
+    currentPowerMode = POWER_BLE_ACTIVE;
+    
+    Serial.printf("BLE active mode - CPU: %d MHz\n", BLE_CPU_FREQ);
+  }
+}
+
+void enterLowPowerMode() {
+  if (currentPowerMode != POWER_LOW_POWER) {
+    Serial.println("Entering low power mode (no BLE)");
+    
+    // Stop BLE to save power
+    stopBLE();
+    
+    // Reduce CPU to 10MHz for I2C/GPIO operations
+    setCpuFrequencyMhz(LOW_POWER_CPU_FREQ);
+    
+    // Turn off screen
+    if (screenOn) {
+      M5.Display.clear();
+      M5.Display.sleep();
+      screenOn = false;
+    }
+    
+    // Reduce LED brightness further
+    ledcWrite(0, 2); // Very dim breathing
+    
+    currentPowerMode = POWER_LOW_POWER;
+    
+    Serial.printf("Low power mode - CPU: %d MHz, BLE: OFF\n", LOW_POWER_CPU_FREQ);
+  }
+}
+
+void enterScreenOffMode() {
+  if (screenOn) {
+    Serial.println("Turning off screen");
+    
+    // Turn off display
+    M5.Display.clear();
+    M5.Display.sleep();
+    screenOn = false;
+    
+    Serial.println("Screen off");
+  }
+}
+
+void exitScreenOffMode() {
   if (!screenOn) {
     Serial.println("Turning on screen");
+    
+    // Wake up display
     M5.Display.wakeup();
-    M5.Display.setBrightness(13); // 5% brightness
+    M5.Display.setBrightness(13); // 5% brightness (13/255 ≈ 5%)
     screenOn = true;
-    initializeDisplay();
+    
     Serial.println("Screen on at 5% brightness");
   }
 }
 
-void turnOffScreen() {
-  if (screenOn) {
-    Serial.println("Turning off screen");
-    M5.Display.clear();
-    M5.Display.sleep();
-    screenOn = false;
-    Serial.println("Screen off");
+void enterULPSleep() {
+  Serial.println("=== ENTERING ULP SLEEP MODE ===");
+  
+  // Show sleep message on screen briefly
+  M5.Display.wakeup();
+  M5.Display.setBrightness(50);
+  M5.Display.clear();
+  M5.Display.setRotation(0);
+  M5.Display.setTextColor(ORANGE);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(10, 20);
+  M5.Display.print("GOING TO");
+  M5.Display.setCursor(10, 50);
+  M5.Display.print("DEEP SLEEP");
+
+  delay(3000); // Show for 3 seconds
+  
+  // Turn off everything
+  M5.Display.clear();
+  M5.Display.sleep();
+  ledcWrite(0, 0);
+  screenOn = false;
+  
+  // Stop BLE to save maximum power
+  stopBLE();
+  
+  // Save current state
+  prefs.begin("sterzo", false);
+  prefs.putBool("wasAsleep", true);
+  prefs.putULong("sleepTime", millis());
+  prefs.end();
+  
+  currentPowerMode = POWER_ULP_SLEEP;
+  
+  // Configure ULP wake sources if not already done
+  if (!ulpProgramLoaded) {
+    setupULPProgram();
+  }
+  
+  // Debug: Show current wake-up configuration
+  Serial.printf("Wake-up sources configured:\n");
+  Serial.printf("- ext0: GPIO37 (Button A) on LOW\n");
+  Serial.printf("- ext1: GPIO35 (Button C) on LOW\n");
+  Serial.printf("- No timer wake - button only\n");
+  
+  Serial.printf("Going to ULP sleep (button wake only)...\n");
+  Serial.flush(); // Ensure all serial output is sent
+  
+  // Enter deep sleep with ULP monitoring
+  esp_deep_sleep_start();
+}
+
+void handleWakeupFromSleep() {
+  // CRITICAL: Set HOLD pin HIGH immediately to maintain power after wake-up
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
+  rtc_gpio_hold_en(GPIO_NUM_4);   // keep HOLD=1 while sleeping
+
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  
+  // Debug: Show which button woke us up
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("WAKE-UP: Button A pressed (ext0)");
+  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+    Serial.println("WAKE-UP: Button C pressed (ext1)");
+  } else {
+    Serial.printf("WAKE-UP: Unknown source (%d)\n", wakeup_reason);
+  }
+  
+  // Always turn on screen and show wake reason prominently
+  M5.Display.wakeup();
+  M5.Display.setBrightness(50); // Higher brightness for wake display
+  M5.Display.clear();
+  M5.Display.setRotation(0);
+  //showSplashOverlay("Starting up", "", "", 1500);
+  
+  enterBLEWaitingMode();
+  }
+  
+void updatePowerManagement(float gx, float gy, float gz, float ax, float ay, float az) {
+  unsigned long currentTime = millis();
+  
+  // Check for motion
+  bool motionDetected = detectMotion(gx, gy, gz, ax, ay, az);
+  
+  if (motionDetected) {
+    lastMotionTime = currentTime;
+    // Debug: Show when motion keeps screen on
+    if (!screenOn && currentTime - lastMotionTime <= 30000) {
+      Serial.println("Motion detected - keeping screen on");
+    } else if (motionDetected) {
+      Serial.println("Motion detected - resetting activity timer");
+    }
+  }
+  
+  // Update BLE activity time if connected
+  if (deviceConnected) {
+    lastBLEActivityTime = currentTime;
+    // Switch to BLE active mode when connected
+    if (currentPowerMode != POWER_BLE_ACTIVE) {
+      enterBLEActiveMode();
+    }
+  }
+  
+  // Screen management - keep screen on when:
+  // 1. Recently pressed button (60s)
+  // 2. Connected to Zwift (active connection)
+  // 3. Recent motion detected (30s)
+  // 4. BLE connected and recent motion (<300s)
+  bool shouldKeepScreenOn = false;
+  
+  if (currentTime - lastButtonTime <= SCREEN_ON_TIMEOUT) {
+    shouldKeepScreenOn = true; // Button recently pressed
+  } else if (zwiftConnected) {
+    shouldKeepScreenOn = true; // Connected to Zwift
+  } else if (deviceConnected && (currentTime - lastMotionTime <= NO_MOTION_TIMEOUT_CONNECTED)) {
+    shouldKeepScreenOn = true; // BLE connected and recent motion
+  }
+  else if (!deviceConnected && (currentTime - lastMotionTime <= 30000)) { // 30s after motion when not connected
+    shouldKeepScreenOn = true; // Recent motion detected
+  }
+  
+  if (shouldKeepScreenOn) {
+    if (!screenOn) {
+      exitScreenOffMode();
+    }
+  } else {
+    if (screenOn) {
+      enterScreenOffMode();
+    }
+  }
+  
+  // Power mode transitions based on activity and connection state
+  if (!isCalibrating) {
+    if (deviceConnected) {
+      // Stay in BLE active mode when connected
+      if (currentPowerMode != POWER_BLE_ACTIVE) {
+        enterBLEActiveMode();
+      }
+    } else {
+      // Not connected - manage power modes based on time and activity
+      unsigned long timeSinceActivity = min(currentTime - lastMotionTime, currentTime - lastButtonTime);
+      unsigned long timeSinceBLEStart = currentTime - bleStartTime;
+      
+      switch (currentPowerMode) {
+        case POWER_BLE_WAITING: {
+          // After 5 minutes of no connection, enter low power mode
+          if (timeSinceBLEStart > BLE_WAIT_TIMEOUT) {
+            enterLowPowerMode();
+          }
+          break;
+        }
+          
+        case POWER_BLE_ACTIVE: {
+          // If disconnected, go back to waiting mode
+          enterBLEWaitingMode();
+          break;
+        }
+          
+        case POWER_LOW_POWER: {
+          // After 2 minutes in low power with no activity, enter ULP sleep
+          if (timeSinceActivity > LOW_POWER_TIMEOUT) {
+            enterULPSleep();
+          }
+          break;
+        }
+          
+        case POWER_ULP_SLEEP: {
+          // Already in ULP sleep - wake-up handling will manage transitions
+          break;
+        }
+      }
+    }
   }
 }
 
 // —————— BLE Callbacks ——————
 class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* s) override {
+  void onConnect (BLEServer* s) override {
     deviceConnected = true;
-    lastActivityTime = millis();
+    lastBLEActivityTime = millis();
     Serial.println("BLE client connected");
     
-    // Show connection success message if screen is on
-    if (screenOn) {
-      showConnectionScreen(true);
+    // Turn on screen for 1 minute to show connection success
+    if (!screenOn) {
+      exitScreenOffMode();
     }
+    lastButtonTime = millis(); // Reset screen timer for 1 minute display
+    
+    // Show connection success message
+    M5.Display.clear();
+    M5.Display.setRotation(0);
+    M5.Display.setTextColor(0x07E0); // GREEN
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(10, 20);
+    M5.Display.print("BLE");
+    M5.Display.setCursor(10, 45);
+    M5.Display.print("CONNECTED");
+    M5.Display.setTextColor(0xFFFF); // WHITE
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(10, 80);
+    M5.Display.print("Screen on for 1min");
+    
+    showOverlay("CONNECTED", 1500);
     
     // Success beep pattern
     M5.Speaker.tone(800, 100);
@@ -553,14 +1182,27 @@ class MyServerCallbacks : public BLEServerCallbacks {
     delay(150);
     M5.Speaker.tone(1200, 150);
   }
-  
-  void onDisconnect(BLEServer* s) override {
+  void onDisconnect (BLEServer* s) override {
     deviceConnected = false;
+    zwiftConnected = false; // Reset Zwift connection status
     Serial.println("BLE client disconnected");
     
     // Show disconnection message if screen is on
     if (screenOn) {
-      showConnectionScreen(false);
+      M5.Display.clear();
+      M5.Display.setRotation(0);
+      M5.Display.setTextColor(0xF800); // RED
+      M5.Display.setTextSize(2);
+      M5.Display.setCursor(10, 20);
+      M5.Display.print("BLE");
+      M5.Display.setCursor(10, 45);
+      M5.Display.print("DISCONNECTED");
+      M5.Display.setTextColor(0xFFFF); // WHITE
+      M5.Display.setTextSize(1);
+      M5.Display.setCursor(10, 80);
+      M5.Display.print("Advertising...");
+      
+      showOverlay("DISCONNECTED", 1500);
       
       // Disconnection beep
       M5.Speaker.tone(600, 200);
@@ -572,6 +1214,8 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
 class char31Callbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* c) override {
+    lastBLEActivityTime = millis(); // Track BLE activity for power management
+    
     auto val = c->getValue();
     Serial.print("char31 onWrite: ");
     for (auto &b: val) { Serial.printf("%02X ", b); }
@@ -583,6 +1227,7 @@ class char31Callbacks : public BLECharacteristicCallbacks {
       uint8_t chal[4] = {0x03,0x10,0x12,0x34};
       pChar32->setValue(chal,4);
       pChar32->indicate();
+      zwiftConnected = false; // Reset on new handshake attempt
     }
     else if (val.size()>=2 && val[0]==0x03 && val[1]==0x11) {
       Serial.println("→ got 0x311, marking challengeOK");
@@ -592,13 +1237,17 @@ class char31Callbacks : public BLECharacteristicCallbacks {
       pChar32->indicate();
     }
     else if (val.size()>=6 && val[0]==0x03 && val[1]==0x12) {
-      uint32_t seed = ((uint32_t)val[5]<<24) | ((uint32_t)val[4]<<16) | ((uint32_t)val[3]<<8) | ((uint32_t)val[2]);
-      uint32_t pwd = hashed(seed);
+      // client has sent seed bytes in val[2..5]
+      uint32_t seed = ( (uint32_t)val[5]<<24 ) |
+                      ( (uint32_t)val[4]<<16 ) |
+                      ( (uint32_t)val[3]<<8  ) |
+                      ( (uint32_t)val[2]     );
+      uint32_t pwd  = hashed(seed);
       Serial.printf("→ got 0x312, seed=0x%08X, pwd=0x%08X\n", seed, pwd);
       uint8_t res[6];
       res[0]=0x03; res[1]=0x12;
-      res[2]= pwd & 0xFF;
-      res[3]=(pwd >> 8) & 0xFF;
+      res[2]= pwd        & 0xFF;
+      res[3]=(pwd >>  8) & 0xFF;
       res[4]=(pwd >> 16) & 0xFF;
       res[5]=(pwd >> 24) & 0xFF;
       pChar32->setValue(res,6);
@@ -610,8 +1259,15 @@ class char31Callbacks : public BLECharacteristicCallbacks {
       pChar32->setValue(r,3);
       pChar32->indicate();
       challengeOK = true;
+      zwiftConnected = true; // Mark as actively connected to Zwift
+      Serial.println("Zwift connection established - keeping screen on indefinitely");
     }
   }
+};
+
+class char32Callbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) override { Serial.println("char32 onWrite"); }
+  void onRead (BLECharacteristic* c) override { Serial.println("char32 onRead");  }
 };
 
 class char32Desc2902Callbacks : public BLEDescriptorCallbacks {
@@ -621,377 +1277,826 @@ class char32Desc2902Callbacks : public BLEDescriptorCallbacks {
   }
 };
 
-// —————— IMU Functions ——————
-void updateGravityVector() {
-    float gx, gy, gz, ax, ay, az;
-    M5.Imu.getGyro(&gx, &gy, &gz);
-    M5.Imu.getAccel(&ax, &ay, &az);
-    
-  // Update Mahony AHRS with calibrated data
-  MahonyAHRSupdateIMU(
-    (gx - gyroBiasX) * DEG_TO_RAD,
-    (gy - gyroBiasY) * DEG_TO_RAD,
-    (gz - gyroBiasZ) * DEG_TO_RAD,
-    ax - accelBiasX,
-    ay - accelBiasY,
-    az - accelBiasZ,
-    &currentPitch, &currentRoll, &currentYaw
-  );
+// —————— Helpers ——————
+void sendSteeringBin(float bin) {
+  pChar30->setValue((uint8_t*)&bin, sizeof(bin));
+  pChar30->notify();
+  Serial.printf("NOTIFY bin: %.0f°\n", bin);
+}
+
+// —————— Calibration Functions ——————
+
+// Apply low-pass filter to gyro readings
+void filterGyroReadings(float gx, float gy, float gz) {
+  filteredGx = gyroFilterAlpha * gx + (1.0f - gyroFilterAlpha) * filteredGx;
+  filteredGy = gyroFilterAlpha * gy + (1.0f - gyroFilterAlpha) * filteredGy;
+  filteredGz = gyroFilterAlpha * gz + (1.0f - gyroFilterAlpha) * filteredGz;
+}
+
+// Initialize drift monitoring array
+void initGyroDriftMonitoring() {
+  for (int i = 0; i < DRIFT_SAMPLES_COUNT; i++) {
+    gyroDriftSamples[i] = 0.0f;
+  }
+  gyroDriftIndex = 0;
+  driftArrayFilled = false;
+  lastDriftSampleTime = millis();
+  Serial.println("Gyro drift monitoring initialized");
+}
+
+// Add a new gyro drift sample (call every second)
+void addGyroDriftSample(float gx, float gy, float gz) {
+  // Calculate gyro magnitude as drift indicator
+  float gyroMagnitude = sqrt(gx*gx + gy*gy + gz*gz);
   
-  // Normalize accelerometer data to get gravity vector
-  float magnitude = sqrt(ax * ax + ay * ay + az * az);
-  if (magnitude > 0.1f) {
-    currentGravityX = ax / magnitude;
-    currentGravityY = ay / magnitude;
-    currentGravityZ = az / magnitude;
+  // Add to circular buffer
+  gyroDriftSamples[gyroDriftIndex] = gyroMagnitude;
+  gyroDriftIndex = (gyroDriftIndex + 1) % DRIFT_SAMPLES_COUNT;
+  
+  // Mark array as filled once we've wrapped around
+  if (gyroDriftIndex == 0 && !driftArrayFilled) {
+    driftArrayFilled = true;
+    Serial.println("Gyro drift buffer filled - starting 60s trailing average reports");
   }
 }
 
-bool checkForPositionChange() {
-  if (wakeCount <= 1) return false; // No baseline yet
+// Calculate and report 60-second trailing average
+void reportGyroDriftAverage() {
+  if (!driftArrayFilled && gyroDriftIndex < 10) {
+    return; // Need at least 10 samples before reporting anything meaningful
+  }
   
-  // Static variables to track baseline position for ongoing monitoring
-  static float baselineGravityX = 0.0f;
-  static float baselineGravityY = 0.0f;
-  static float baselineGravityZ = 0.0f;
-  static bool baselineSet = false;
-  static unsigned long lastPositionCheck = 0;
+  // Calculate average over available samples
+  int sampleCount = driftArrayFilled ? DRIFT_SAMPLES_COUNT : gyroDriftIndex;
+  float sum = 0.0f;
+  float minDrift = 999.0f, maxDrift = -999.0f;
+  
+  for (int i = 0; i < sampleCount; i++) {
+    sum += gyroDriftSamples[i];
+    if (gyroDriftSamples[i] < minDrift) minDrift = gyroDriftSamples[i];
+    if (gyroDriftSamples[i] > maxDrift) maxDrift = gyroDriftSamples[i];
+  }
+  
+  float avgDrift = sum / sampleCount;
+  
+  // Calculate standard deviation for drift stability assessment
+  float variance = 0.0f;
+  for (int i = 0; i < sampleCount; i++) {
+    float diff = gyroDriftSamples[i] - avgDrift;
+    variance += diff * diff;
+  }
+  float stdDev = sqrt(variance / sampleCount);
+  
+  // Report comprehensive drift statistics
+  Serial.println("=== 60-SECOND GYRO DRIFT REPORT ===");
+  Serial.printf("Samples: %d | Avg: %.3f°/s | Min: %.3f°/s | Max: %.3f°/s | StdDev: %.3f°/s\n", 
+                sampleCount, avgDrift, minDrift, maxDrift, stdDev);
+  
+   
+  Serial.println("=====================================");
+}
+
+// Check if calibration data exists
+bool calibrationExists() {
+  // Try to load IMU calibration from NVS
+  return loadIMUCalibration();
+}
+
+// Non-blocking centering state variables
+static bool centeringActive = false;
+static unsigned long centeringStartTime = 0;
+static int centeringCountdown = 0;
+static unsigned long lastCountdownTime = 0;
+
+// Start the centering process (non-blocking)
+void startCentering() {
+  Serial.println("Starting centering process...");
+  
+  // Distinctive beep pattern
+  M5.Speaker.tone(800, 50);
+  
+  centeringActive = true;
+  centeringStartTime = millis();
+  centeringCountdown = 3;
+  lastCountdownTime = millis();
+  
+  // Show initial countdown
+  showOverlay("CENTER IN 3", 1100);
+  M5.Speaker.tone(600, 100);
+}
+
+// Update centering process (called from main loop)
+void updateCentering() {
+  if (!centeringActive) return;
   
   unsigned long currentTime = millis();
   
-  // In activity check mode: compare against sleep position once
-  if (isInActivityCheckMode) {
-    // Calculate angular difference between sleep and current gravity vectors
-    float dotProduct = sleepGravityX * currentGravityX + 
-                      sleepGravityY * currentGravityY + 
-                      sleepGravityZ * currentGravityZ;
-    
-    // Clamp dot product to valid range for acos
-    dotProduct = constrain(dotProduct, -1.0f, 1.0f);
-    
-    // Calculate angle in degrees
-    float angleDifference = acos(dotProduct) * 180.0f / PI;
-    
-    Serial.printf("=== WAKE-UP POSITION CHECK ===\n");
-    Serial.printf("Sleep gravity: (%.3f, %.3f, %.3f)\n", sleepGravityX, sleepGravityY, sleepGravityZ);
-    Serial.printf("Current gravity: (%.3f, %.3f, %.3f)\n", currentGravityX, currentGravityY, currentGravityZ);
-    Serial.printf("Angle difference: %.2f degrees (threshold: %.2f)\n", angleDifference, POSITION_THRESHOLD_DEGREES);
-    Serial.printf("Position changed since sleep: %s\n", (angleDifference > POSITION_THRESHOLD_DEGREES) ? "YES" : "NO");
-    Serial.printf("===============================\n");
-    
-    // If position changed, set current position as new baseline for ongoing monitoring
-    if (angleDifference > POSITION_THRESHOLD_DEGREES) {
-      baselineGravityX = currentGravityX;
-      baselineGravityY = currentGravityY;
-      baselineGravityZ = currentGravityZ;
-      baselineSet = true;
-      lastPositionCheck = currentTime;
-      Serial.println("New baseline position set for ongoing monitoring");
+  // Handle countdown phase
+  if (centeringCountdown > 0) {
+    if (currentTime - lastCountdownTime >= 1000) {
+      centeringCountdown--;
+      lastCountdownTime = currentTime;
+      
+      if (centeringCountdown > 0) {
+        showOverlay("CENTER IN " + String(centeringCountdown), 1100);
+        M5.Speaker.tone(600, 100);
+      } else {
+        // Countdown finished, perform centering
+        showOverlay("CENTERING...", 1000);
+        executeCentering();
+      }
     }
-    
-    return angleDifference > POSITION_THRESHOLD_DEGREES;
   }
-  
-  // In normal monitoring mode: compare against recent baseline at 1Hz
-  if (!baselineSet) {
-    // Set initial baseline if not set
-    baselineGravityX = currentGravityX;
-    baselineGravityY = currentGravityY;
-    baselineGravityZ = currentGravityZ;
-    baselineSet = true;
-    lastPositionCheck = currentTime;
-    Serial.println("Initial baseline position set for monitoring");
-    return false;
-  }
-  
-  // Check position at 1Hz rate
-  if (currentTime - lastPositionCheck < 1000) {
-    return false; // Not time to check yet
-  }
-  
-  lastPositionCheck = currentTime;
-  
-  // Calculate angular difference between baseline and current gravity vectors
-  float dotProduct = baselineGravityX * currentGravityX + 
-                    baselineGravityY * currentGravityY + 
-                    baselineGravityZ * currentGravityZ;
-  
-  // Clamp dot product to valid range for acos
-  dotProduct = constrain(dotProduct, -1.0f, 1.0f);
-  
-  // Calculate angle in degrees
-  float angleDifference = acos(dotProduct) * 180.0f / PI;
-  
-  bool positionChanged = angleDifference > POSITION_THRESHOLD_DEGREES;
-  
-  if (positionChanged) {
-    Serial.printf("=== ONGOING POSITION CHECK ===\n");
-    Serial.printf("Baseline gravity: (%.3f, %.3f, %.3f)\n", baselineGravityX, baselineGravityY, baselineGravityZ);
-    Serial.printf("Current gravity: (%.3f, %.3f, %.3f)\n", currentGravityX, currentGravityY, currentGravityZ);
-    Serial.printf("Angle difference: %.2f degrees (threshold: %.2f)\n", angleDifference, POSITION_THRESHOLD_DEGREES);
-    Serial.printf("Position changed: YES - updating baseline\n");
-    Serial.printf("===============================\n");
-    
-    // Update baseline to current position for next comparison
-    baselineGravityX = currentGravityX;
-    baselineGravityY = currentGravityY;
-    baselineGravityZ = currentGravityZ;
-  }
-  
-  return positionChanged;
 }
 
-bool checkForButtonActivity() {
-  static bool lastBtnA = HIGH, lastBtnB = HIGH;
-  bool currentBtnA = digitalRead(37);
-  bool currentBtnB = digitalRead(39);
-  
-  bool buttonActivity = false;
-  
-  if (currentBtnA != lastBtnA) {
-    Serial.printf("BUTTON A: %s\n", currentBtnA == LOW ? "PRESSED" : "RELEASED");
-    buttonActivity = true;
-    lastBtnA = currentBtnA;
-  }
-  
-  if (currentBtnB != lastBtnB) {
-    Serial.printf("BUTTON B: %s\n", currentBtnB == LOW ? "PRESSED" : "RELEASED");
-    buttonActivity = true;
-    lastBtnB = currentBtnB;
-  }
-  
-  return buttonActivity;
-}
-
-
-
-// —————— Calibration Functions ——————
-bool calibrationExists() {
-  // Check if key gyro calibration values exist
-  prefs.begin("sterzo", true); // Read-only
-  bool exists = prefs.isKey("gxb") && prefs.isKey("gyb") && prefs.isKey("gzb");
-  prefs.end();
-  return exists;
-}
-
-void performGyroCalibration() {
-  Serial.println("=== STARTING GYRO CALIBRATION ===");
-  
-  if (screenOn) {
-    showStatusMessage("CALIBRATION", "Keep device still", ORANGE, 1000);
-  }
-  
-  // Reset gyro biases
-  gyroBiasX = gyroBiasY = gyroBiasZ = 0;
-  
-  // Collect 100 samples over 2 seconds
-  const int samples = 100;
-  float sumGx = 0, sumGy = 0, sumGz = 0;
-  
-  Serial.println("Collecting gyro samples...");
-  
-  for (int i = 0; i < samples; i++) {
-  float gx, gy, gz, ax, ay, az;
-  M5.Imu.getGyro(&gx, &gy, &gz);
-  M5.Imu.getAccel(&ax, &ay, &az);
-  
-    sumGx += gx; 
-    sumGy += gy; 
-    sumGz += gz;
-    
-    // Update display progress
-    if (screenOn && i % 10 == 0) {
-      char progressText[32];
-      snprintf(progressText, sizeof(progressText), "Progress: %d%%", (i * 100) / samples);
-      showStatusMessage("CALIBRATION", progressText, ORANGE, 50);
-    }
-    
-    delay(20); // 50Hz sampling
-  }
-  
-  // Calculate gyro biases
-  gyroBiasX = sumGx / samples;
-  gyroBiasY = sumGy / samples;
-  gyroBiasZ = sumGz / samples;
-  
-  Serial.printf("Gyro calibration complete - Bias: %.3f,%.3f,%.3f\n", 
-                gyroBiasX, gyroBiasY, gyroBiasZ);
-    
-  // Save gyro biases
-  prefs.begin("sterzo", false);
-  prefs.putFloat("gxb", gyroBiasX);
-  prefs.putFloat("gyb", gyroBiasY);
-  prefs.putFloat("gzb", gyroBiasZ);
-  prefs.end();
-  
-  if (screenOn) {
-    showStatusMessage("CALIBRATION", "Complete!", GREEN, 2000);
-  }
-  
-  Serial.println("=== GYRO CALIBRATION COMPLETE ===");
-  }
-  
-// —————— Button Handling Functions ——————
-void quickRecenterYaw() {
-  Serial.println("Quick recentering yaw...");
-  
-  // Distinctive beep pattern for quick recenter
-  M5.Speaker.tone(800, 50);
-      delay(100);
-  M5.Speaker.tone(1000, 50);
-  
-  // Get current raw yaw and set offset to make current position = 0
+// Execute the actual centering (simple, single reading)
+void executeCentering() {
+  // Get current raw yaw (already being updated in main loop)
   float currentRawYaw = getYaw();
   
   if (!isnan(currentRawYaw) && !isinf(currentRawYaw)) {
+    // Set offset to make current position = 0
     yawOffset = -currentRawYaw;
     
     // Normalize offset to [-180, 180] range
     while (yawOffset > 180) yawOffset -= 360;
     while (yawOffset < -180) yawOffset += 360;
     
-    // Save to preferences
-    prefs.begin("sterzo", false);
     prefs.putFloat("yoff", yawOffset);
-    prefs.end();
+    Serial.printf("Centering complete - Current raw yaw: %.1f°, New offset: %.1f°\n", currentRawYaw, yawOffset);
     
-    Serial.printf("Quick recenter - Current raw yaw: %.1f°, New offset: %.1f°\n", currentRawYaw, yawOffset);
+    // Store the current raw yaw for drift compensation
+    lastMeasuredRawYaw = currentRawYaw;
+    lastYawMeasurementTime = millis();
+    hasValidYawMeasurement = true;
     
-    // Show confirmation if screen is on
-    if (screenOn) {
-      showStatusMessage("ZEROing", "Yaw to 0", GREEN, 1500);
-    }
+    
+    //showOverlay("CENTERED", 1500);
+    
   } else {
-    Serial.println("WARNING: Invalid yaw value during quick recenter");
+    Serial.println("WARNING: Invalid yaw value during centering");
+    showOverlay("CENTER ERROR", 1500);
+  }
+  
+  centeringActive = false;
+}
+
+// Quick recenter - now just triggers the non-blocking process
+void quickRecenterYaw() {
+  startCentering();
+}
+
+// Recenter yaw to current position
+void recenterYaw() {
+  startCentering(); // Use the same simple, non-blocking process
+}
+
+// Auto-calibration on first boot
+void performAutoCalibration() {
+  Serial.println("=== AUTO CALIBRATION ===");
+  
+  if (screenOn) {
+    M5.Display.clear();
+    M5.Display.setRotation(0);
+    M5.Display.setCursor(0, 10);
+    M5.Display.print("AUTO CALIBRATION");
+    M5.Display.setCursor(0, 25);
+    M5.Display.print("Keep device still");
+    M5.Display.setCursor(0, 40);
+    M5.Display.print("10 seconds...");
+  }
+  
+  // Use the new IMU calibration system
+  startIMUCalibration();
+}
+
+// Auto-recenter on boot
+void performAutoRecenter() {
+  recenterYaw();
+}
+
+// Initialize Mahony filter with current device orientation
+void initializeMahonyFilter() {
+  Serial.println("Initializing Mahony filter with current orientation...");
+  
+  // Reset quaternion to identity
+  initMahonyData();
+  
+  // Collect IMU data for a few seconds to stabilize the filter
+  const int initSamples = 100; // 10 seconds at 10Hz
+  
+  for (int i = 0; i < initSamples; i++) {
+    float gx, gy, gz, ax, ay, az;
+    M5.Imu.getGyro(&gx, &gy, &gz);
+    M5.Imu.getAccel(&ax, &ay, &az);
+    
+    // Apply filtering
+    filterGyroReadings(gx, gy, gz);
+    
+    // Update Mahony filter with calibrated data
+    MahonyAHRSupdateIMU(
+      filteredGx * DEG_TO_RAD,
+      filteredGy * DEG_TO_RAD,
+      filteredGz * DEG_TO_RAD,
+      ax,
+      ay,
+      az,
+      currentIMUFrequency
+    );
+    
+    delay(100); // 100ms = 10Hz
+  }
+  
+  // Get initial yaw reading
+  float initialYaw = getYaw();
+  Serial.printf("Mahony filter initialized - Initial yaw: %.1f°\n", initialYaw);
+}
+
+// Gyro-only calibration (legacy function - now uses new IMU system)
+void performGyroCalibration() {
+  Serial.println("Gyro calibration - using new IMU calibration system");
+  startIMUCalibration();
+}
+
+// Full calibration (legacy function - now uses new IMU system)
+void performFullCalibration() {
+  Serial.println("Full calibration - using new IMU calibration system");
+  startIMUCalibration();
+}
+
+// —————— NEW IMU CALIBRATION SYSTEM ——————
+
+void startIMUCalibration() {
+  Serial.println("=== STARTING IMU CALIBRATION ===");
+  
+  // Start calibration for accelerometer and gyro
+  M5.Imu.setCalibration(IMU_CALIB_STRENGTH, IMU_CALIB_STRENGTH, 0);
+  
+  imuCalibCountdown = 10;
+  isCalibrating = true;
+  
+  // Show initial calibration message
+  showOverlay("CALIBRATING...", 1000);
+  
+  Serial.println("IMU calibration started - keep device still for 10 seconds");
+}
+
+void updateIMUCalibration(uint32_t countdown, bool clear) {
+  imuCalibCountdown = countdown;
+  
+  // Show countdown as overlay
+  if (countdown > 0) {
+    showOverlay("CALIB " + String(countdown), 1000);
+  }
+
+  if (countdown == 0) {
+    clear = true;
+  }
+  
+  if (clear) {
+    if (countdown > 0) {
+      // Start calibration
+      M5.Imu.setCalibration(IMU_CALIB_STRENGTH, IMU_CALIB_STRENGTH, 0);
+    } else {
+      // Stop calibration and save
+      M5.Imu.setCalibration(0, 0, 0);
+      saveIMUCalibration();
+    }
   }
 }
 
-void handleButtonPresses() {
-  // Button state tracking
-  static unsigned long buttonAStartTime = 0;
-  static unsigned long buttonBStartTime = 0;
-  static unsigned long buttonCStartTime = 0;
-  static bool buttonAWasPressed = false;
-  static bool buttonBWasPressed = false;
-  static bool buttonCWasPressed = false;
+void stopIMUCalibration() {
+  Serial.println("=== STOPPING IMU CALIBRATION ===");
   
-  // Read button states (active LOW)
-  bool buttonAState = !digitalRead(37); // Button A
-  bool buttonBState = !digitalRead(39); // Button B
-  bool buttonCState = !digitalRead(35); // Button C
+  // Stop all calibration
+  M5.Imu.setCalibration(0, 0, 0);
   
-  // Button A handling
-  if (buttonAState && !buttonAWasPressed) {
-    buttonAStartTime = millis();
-    buttonAWasPressed = true;
-    lastActivityTime = millis(); // Update activity time
-    Serial.println("Button A pressed");
-  } else if (!buttonAState && buttonAWasPressed) {
-    unsigned long pressDuration = millis() - buttonAStartTime;
-    buttonAWasPressed = false;
+  // Save calibration values to NVS
+  saveIMUCalibration();
+  
+  // Recenter yaw after calibration
+  recenterYaw();
+  
+  imuCalibrationActive = false;
+  isCalibrating = false;
+  
+  showOverlay("CALIBRATION OK", 1500);
+  
+  Serial.println("=== IMU CALIBRATION COMPLETE ===");
+}
+
+bool loadIMUCalibration() {
+  Serial.println("=== LOADING IMU CALIBRATION FROM NVS ===");
+  bool success = M5.Imu.loadOffsetFromNVS();
+  
+  if (success) {
+    Serial.println("✓ IMU calibration loaded successfully");
     
-    if (pressDuration < 500) {
-       // Short press - quick recenter
-        Serial.println("Button A: Quick recenter");
-        M5.Speaker.tone(800, 100);
-        quickRecenterYaw();
-       
-       // Turn on screen if it's off
-       if (!screenOn) {
-         turnOnScreen();
-      }
-    } else if (pressDuration >= 2000) {
-       // Long press - gyro calibration
-      Serial.println("Button A: Long press - Gyro calibration");
-      performGyroCalibration();
-    }
-  }
-  
-  // Button B handling
-  if (buttonBState && !buttonBWasPressed) {
-    buttonBStartTime = millis();
-    buttonBWasPressed = true;
-    lastActivityTime = millis(); // Update activity time
-    Serial.println("Button B pressed");
-  } else if (!buttonBState && buttonBWasPressed) {
-    unsigned long pressDuration = millis() - buttonBStartTime;
-    buttonBWasPressed = false;
+    // Get the loaded offset data for debugging with proper labels
+    Serial.println("Loaded bias values:");
+    float gyroXBias = 0, gyroYBias = 0, gyroZBias = 0;
+    float accelXBias = 0, accelYBias = 0, accelZBias = 0;
     
-    if (pressDuration < 500) {
-       // Short press - quick recenter
-      Serial.println("Button B: Quick recenter");
-      M5.Speaker.tone(1000, 100);
-      quickRecenterYaw();
-       
-       // Turn on screen if it's off
-       if (!screenOn) {
-         turnOnScreen();
-       }
-     } else if (pressDuration >= 2000) {
-       // Long press - gyro calibration
-      Serial.println("Button B: Long press - Gyro calibration");
-      performGyroCalibration();
-    }
-  }
-  
-  // Button C handling
-  if (buttonCState && !buttonCWasPressed) {
-    buttonCStartTime = millis();
-    buttonCWasPressed = true;
-    lastActivityTime = millis(); // Update activity time
-    Serial.println("Button C pressed");
-  } else if (!buttonCState && buttonCWasPressed) {
-    unsigned long pressDuration = millis() - buttonCStartTime;
-    buttonCWasPressed = false;
-    
-    if (pressDuration < 500) {
-      // Short press - turn on screen
-      Serial.println("Button C: Turn on screen");
-      M5.Speaker.tone(1200, 100);
+    for (int i = 0; i < 9; i++) {
+      float offset = M5.Imu.getOffsetData(i) * (1.0f / (1 << 19));
+      const char* sensorName = (i < 3) ? "Gyro" : (i < 6) ? "Accel" : "Mag";
+      const char* axisName = (i % 3 == 0) ? "X" : (i % 3 == 1) ? "Y" : "Z";
+      const char* units = (i < 3) ? "°/s" : (i < 6) ? "g" : "µT";
       
-      if (!screenOn) {
-        turnOnScreen();
-        showStatusMessage("SCREEN ON", "Display activated", WHITE, 1500);
+      // Store gyro bias values for summary
+      if (i == 0) gyroXBias = offset;
+      else if (i == 1) gyroYBias = offset;
+      else if (i == 2) gyroZBias = offset;
+      else if (i == 3) accelXBias = offset;
+      else if (i == 4) accelYBias = offset;
+      else if (i == 5) accelZBias = offset;
+      
+      Serial.printf("  %s %s [%d]: %+.6f %s\n", sensorName, axisName, i, offset, units);
+    }
+    
+    // Summary of critical gyro bias values
+    float gyroBiasMagnitude = sqrt(gyroXBias*gyroXBias + gyroYBias*gyroYBias + gyroZBias*gyroZBias);
+    Serial.printf(">>> GYRO BIAS SUMMARY: X=%+.3f Y=%+.3f Z=%+.3f (Magnitude: %.3f °/s)\n", 
+                  gyroXBias, gyroYBias, gyroZBias, gyroBiasMagnitude);
+    
+    if (gyroBiasMagnitude > 1.0f) {
+      Serial.println("⚠️  WARNING: Gyro bias magnitude >1°/s");
+    } else if (gyroBiasMagnitude < 0.01f) {
+      Serial.println("⚠️  WARNING: Gyro bias very small - calibration may not have worked");
+    } else {
+      Serial.println("✓ Gyro bias values look reasonable");
+    }
+    
+  } else {
+    Serial.println("✗ No IMU calibration found in NVS - will perform auto-calibration");
+  }
+  
+  return success;
+}
+
+void saveIMUCalibration() {
+  Serial.println("=== SAVING IMU CALIBRATION TO NVS ===");
+  
+  // Show what we're about to save
+  Serial.println("Bias values being saved:");
+  for (int i = 0; i < 9; i++) {
+    float offset = M5.Imu.getOffsetData(i) * (1.0f / (1 << 19));
+    const char* sensorName = (i < 3) ? "Gyro" : (i < 6) ? "Accel" : "Mag";
+    const char* axisName = (i % 3 == 0) ? "X" : (i % 3 == 1) ? "Y" : "Z";
+    Serial.printf("  %s %s [%d]: %.6f\n", sensorName, axisName, i, offset);
+  }
+  
+  M5.Imu.saveOffsetToNVS();
+  Serial.println("=== IMU CALIBRATION SAVED SUCCESSFULLY ===");
+}
+
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("=== ZTEERStick STARTUP ===");
+  
+  // Power management: Set HOLD pin high to maintain power
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
+  rtc_gpio_hold_en(GPIO_NUM_4);   // keep HOLD=1 while sleeping
+
+  Serial.println("HOLD pin set HIGH to maintain power");
+  
+  auto cfg = M5.config();
+  Serial.println("M5 config created");
+  
+  M5.begin(cfg);
+  Serial.println("M5.begin() completed");
+  
+  // Initialize LittleFS for image storage
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS initialization failed!");
+  } else {
+    Serial.println("LittleFS initialized successfully");
+  }
+  
+  // Configure power management early
+  configurePowerManagement();
+  
+  // Set initial CPU frequency for BLE
+  setCpuFrequencyMhz(BLE_CPU_FREQ);
+  Serial.printf("CPU frequency set to %d MHz for BLE\n", BLE_CPU_FREQ);
+  
+  // Initialize display with 5% brightness
+  M5.Display.setRotation(0);
+  M5.Display.setTextColor(ORANGE);
+  M5.Display.setTextDatum(0);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextSize(2);
+  M5.Display.setBrightness(13); // 5% brightness (13/255 ≈ 5%)
+  screenOn = true;
+  lastButtonTime = millis(); // Screen starts on
+  
+  // Initialize modern display system
+  initializeDisplayBuffer();
+  
+
+  showSplashOverlay("ZTEERStick", "logo.jpg", "Let's ride!", 2000);
+  
+  Serial.println("Display configured at 5% brightness with modern UI");
+  
+  // Setup LED with PWM for breathing pattern
+  pinMode(LED_PIN, OUTPUT);
+  ledcSetup(0, 5000, 8);           // PWM channel 0, 5kHz frequency, 8-bit resolution
+  ledcAttachPin(LED_PIN, 0);       // Attach LED pin to PWM channel 0
+  ledBreathingStartTime = millis();
+  
+  Serial.println("LED configured for breathing pattern");
+
+  // Initialize button GPIO pins
+  pinMode(37, INPUT_PULLUP); // Button A
+  pinMode(39, INPUT_PULLUP); // Button B  
+  pinMode(35, INPUT_PULLUP); // Button C (Power)
+  Serial.println("Button GPIO pins configured (37, 39, 35)");
+  
+  // Check for factory reset request (hold Button B during startup)
+  bool factoryResetRequested = !digitalRead(39);
+  if (factoryResetRequested) {
+    Serial.println("=== FACTORY RESET REQUESTED ===");
+    M5.Display.clear();
+    M5.Display.setRotation(0);
+    M5.Display.setCursor(10, 20);
+    M5.Display.print("FACTORY RESET");
+    M5.Display.setCursor(10, 40);
+    M5.Display.print("Hold Button B");
+    M5.Display.setCursor(10, 60);
+    M5.Display.print("for 3 seconds");
+    
+    // Wait 3 seconds while Button B is held
+    bool resetConfirmed = true;
+    for (int i = 0; i < 30; i++) {
+      if (digitalRead(39)) { // Button B released
+        resetConfirmed = false;
+        break;
+      }
+      delay(100);
+      
+      // Update countdown display
+      M5.Display.setCursor(10, 80);
+      M5.Display.printf("Countdown: %d", 3 - (i/10));
+    }
+    
+    if (resetConfirmed) {
+      Serial.println("Factory reset confirmed - clearing all preferences");
+      M5.Display.clear();
+      M5.Display.setCursor(10, 20);
+      M5.Display.print("CLEARING");
+      M5.Display.setCursor(10, 40);
+      M5.Display.print("PREFERENCES");
+      
+      // Clear all stored preferences
+      prefs.begin("sterzo", false);
+      prefs.clear();
+      prefs.end();
+      
+      M5.Display.setCursor(10, 60);
+      M5.Display.print("DONE!");
+      M5.Display.setCursor(10, 80);
+      M5.Display.print("Restarting...");
+      
+      delay(2000);
+      ESP.restart();
+    } else {
+      Serial.println("Factory reset cancelled");
+      M5.Display.clear();
+      M5.Display.setCursor(10, 40);
+      M5.Display.print("Reset cancelled");
+      delay(1000);
+    }
+  }
+
+  // Initialize Mahony AHRS
+  initMahonyData();
+  Serial.println("Mahony AHRS initialized");
+
+  // Initialize gyro drift monitoring
+  initGyroDriftMonitoring();
+
+  // Initialize power management variables
+  lastMotionTime = millis();
+  lastBLEActivityTime = millis();
+  lastMotionAccumulatorReset = millis();
+  motionAccumulator = 0.0f;
+  currentPowerMode = POWER_BLE_WAITING;
+  bleStartTime = millis();
+  
+  // Check if we woke up from deep sleep
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    Serial.println("=== FRESH BOOT (not from deep sleep) ===");
+  } else {
+    Serial.printf("=== WOKE FROM DEEP SLEEP (reason: %d) ===\n", wakeup_reason);
+    handleWakeupFromSleep();
+  }
+  
+  // Always zero yaw heading on startup/wake-up
+  Serial.println("Zeroing yaw heading for fresh start...");
+  yawOffset = 0.0f;
+  prefs.putFloat("yoff", yawOffset);
+  Serial.println("Yaw heading reset to 0°");
+
+  // Initialize preferences
+  Serial.println("Loading calibration data...");
+  prefs.begin("sterzo", false);
+  
+  // Check if IMU calibration exists
+  if (!calibrationExists()) {
+    // First boot - no calibration exists
+    Serial.println("No IMU calibration found - performing auto-calibration");
+    performAutoCalibration();
+  } else {
+    // IMU calibration exists - it was loaded by calibrationExists()
+    Serial.println("IMU calibration loaded successfully");
+    
+    // Note: yawOffset already set to 0.0f above - starting fresh
+    Serial.printf("Calibration loaded - YawOffset: %.3f° (fresh start) DriftRate: %.2f°/s\n", 
+                  yawOffset, YAW_DRIFT_RATE);
+    
+    // Initialize Mahony filter with current orientation
+    initializeMahonyFilter();
+  }
+
+  // Initialize BLE system
+  Serial.println("Initializing BLE...");
+  
+  // Start BLE for initial connection attempts
+  startBLE();
+  
+  BLEDevice::init("STERZO");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  pSvc = pServer->createService(STERZO_SERVICE_UUID);
+  
+  pChar14 = pSvc->createCharacteristic(CHAR14_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  pChar30 = pSvc->createCharacteristic(CHAR30_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  pChar31 = pSvc->createCharacteristic(CHAR31_UUID, BLECharacteristic::PROPERTY_WRITE);
+  pChar32 = pSvc->createCharacteristic(CHAR32_UUID, BLECharacteristic::PROPERTY_INDICATE);
+  
+  p2902_14 = new BLE2902();          pChar14->addDescriptor(p2902_14);
+  p2902_30 = new BLE2902(); p2902_30->setNotifications(true); pChar30->addDescriptor(p2902_30);
+  p2902_32 = new BLE2902(); p2902_32->setCallbacks(new char32Desc2902Callbacks()); pChar32->addDescriptor(p2902_32);
+
+  pChar31->setCallbacks(new char31Callbacks());
+  pChar32->setCallbacks(new char32Callbacks());
+
+  pSvc->start();
+  auto adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(STERZO_SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->setMinPreferred(0x06);
+  adv->setMinPreferred(0x12);
+  
+  // Configure BLE advertising for low power
+  adv->setMinInterval(800);  // Longer intervals for power saving
+  adv->setMaxInterval(1600);
+  
+  BLEDevice::startAdvertising();
+  
+  Serial.println("BLE advertising started - waiting for connection");
+
+  // IMU wake-on-motion removed - using button-only wake
+
+  // Display startup message
+  M5.Display.clear();
+  M5.Display.setRotation(0);  
+  M5.Display.setCursor(10, 20);
+  M5.Display.print("ZTEERStick");
+  M5.Display.setCursor(10, 50);
+  M5.Display.print("Ready!");
+  M5.Display.setCursor(10, 80);
+  M5.Display.printf("10Hz IMU");
+  M5.Display.setCursor(10, 110);
+  M5.Display.printf("5%% Screen");
+  
+  Serial.println("=== ZTEERStick READY ===");
+  
+  // Clear the startup message and prepare for the main display
+  displaySprite.fillSprite(TFT_BLACK);
+  displaySprite.pushSprite(0, 0);
+
+  // Note: Wake-up handling now manages power modes directly
+  // No immediate return to sleep needed as wake handler sets appropriate mode
+}
+
+void loop() {
+  M5.update(); // Update button states
+
+  // Update LED breathing pattern
+  updateLEDBreathing();
+
+  // Handle non-blocking centering process
+  updateCentering();
+
+  // Handle IMU calibration countdown
+  static unsigned long lastCalibUpdate = 0;
+  if (isCalibrating) {
+    if (millis() - lastCalibUpdate >= 1000) {
+      lastCalibUpdate = millis();
+      imuCalibCountdown--;
+      
+      if (imuCalibCountdown > 0) {
+        updateIMUCalibration(imuCalibCountdown, false);
+      } else {
+        stopIMUCalibration();
       }
     }
-    // Long press functionality can be added here if needed
+    // Continue with main loop to ensure display updates during calibration
   }
-}
 
-// —————— Steering Functions ——————
-void sendSteeringBin(float bin) {
-  if (pChar30 && deviceConnected) {
-    pChar30->setValue((uint8_t*)&bin, sizeof(bin));
-    pChar30->notify();
-    Serial.printf("NOTIFY bin: %.0f°\n", bin);
-  }
-}
-
-float getYaw() {
-  return -currentYaw; // Invert for correct steering direction
-}
-
-void updateSteering(unsigned long currentTime) {
-  float rawYaw = getYaw();
+  // Calculate dynamic sample frequency with proper limiting for 10Hz
+  static unsigned long lastUpdateTime = 0;
+  unsigned long currentTime = micros();
+  dt = (currentTime - lastUpdateTime) / 1000000.0f; // Calculate time delta in seconds
   
-  // Apply yaw drift compensation at loop frequency
-  if (lastCenteringTime == 0) {
-    lastCenteringTime = currentTime;
+  // Adaptive frequency limiting based on current IMU frequency
+  float minInterval = 1.0f / currentIMUFrequency; // Calculate minimum interval for current frequency
+  if (dt < minInterval) {
+    // Calculate delay needed to maintain target frequency
+    int delayMicros = (int)((minInterval - dt) * 1000000.0f);
+    if (delayMicros > 0 && delayMicros < 200000) { // Cap delay at 200ms
+      delayMicroseconds(delayMicros);
+    }
+    M5.update(); // Update buttons even during delay
+    return;
   }
   
-  float deltaTime = (currentTime - lastCenteringTime) / 1000.0f;
-  if ((currentTime - lastCenteringTime) >= MIN_UPDATE_INTERVAL_MS) { // Respect target update frequency
-    float rel = rawYaw + yawOffset;
+  lastUpdateTime = currentTime;
+  loopfreq = 1.0f / dt; // Calculate loop frequency
+  
+  // Cap frequency at reasonable limits
+  if (loopfreq > currentIMUFrequency * 1.5f) loopfreq = currentIMUFrequency * 1.5f;
+
+  // 1) Read raw IMU, apply bias, fuse
+  float gx, gy, gz, ax, ay, az;
+  
+  // Update IMU data - this also performs calibration if active
+  auto imu_update = M5.Imu.update();
+  if (imu_update) {
+    // Get calibrated IMU data
+    auto imu_data = M5.Imu.getImuData();
+    gx = imu_data.gyro.x;
+    gy = imu_data.gyro.y;
+    gz = imu_data.gyro.z;
+    ax = imu_data.accel.x;
+    ay = imu_data.accel.y;
+    az = imu_data.accel.z;
+  } else {
+    // Fallback to direct reading if update failed
+    M5.Imu.getGyro(&gx,&gy,&gz);
+    M5.Imu.getAccel(&ax,&ay,&az);
+  }
+
+  // Apply low-pass filter to gyro readings
+  filterGyroReadings(gx, gy, gz);
+
+  // Update power management with current IMU readings
+  updatePowerManagement(gx, gy, gz, ax, ay, az);
+
+  // Debug IMU readings every 5 seconds
+  static unsigned long lastDebugTime = 0;
+  if (millis() - lastDebugTime > 5000) {
+    const char* powerModeStr;
+    switch (currentPowerMode) {
+      case POWER_BLE_ACTIVE: powerModeStr = "BLE_ACTIVE"; break;
+      case POWER_BLE_WAITING: powerModeStr = "BLE_WAITING"; break;
+      case POWER_LOW_POWER: powerModeStr = "LOW_POWER"; break;
+      case POWER_ULP_SLEEP: powerModeStr = "ULP_SLESLEEP"; break;
+      default: powerModeStr = "UNKNOWN"; break;
+    }
     
-    // Normalize to [-180, 180]
-    while (rel > 180) rel -= 360;
-    while (rel < -180) rel += 360;
+    // Calculate gyro magnitude for drift monitoring
+    float gyroMagnitude = sqrt(gx*gx + gy*gy + gz*gz);
     
-    // Apply centering force proportional to actual time elapsed
-    float centeringAdjustment = -rel * yawDriftRate * deltaTime;
+    // Consolidated status line with all information
+    unsigned long currentTime = millis();
     
-    // Prevent overshoot: don't adjust more than the distance to center
-    centeringAdjustment = constrain(centeringAdjustment, -abs(rel), abs(rel));
+    // Calculate inactivity timers (same logic as logInactivityStatus)
+    int screenOffCountdown = 0;
+    int sleepCountdown = 0;
+    
+    // Screen countdown logic
+    if (screenOn) {
+      unsigned long timeSinceButton = currentTime - lastButtonTime;
+      if (timeSinceButton <= SCREEN_ON_TIMEOUT) {
+        screenOffCountdown = (SCREEN_ON_TIMEOUT - timeSinceButton) / 1000;
+      } else if (zwiftConnected) {
+        screenOffCountdown = 999; // Indefinite when Zwift connected
+      }
+    }
+    
+    // Sleep countdown logic based on power mode
+    switch (currentPowerMode) {
+      case POWER_BLE_WAITING: {
+        unsigned long timeSinceBLEStart = currentTime - bleStartTime;
+        if (timeSinceBLEStart > BLE_WAIT_TIMEOUT) {
+          sleepCountdown = 0; // Should be in low power
+        } else {
+          sleepCountdown = (BLE_WAIT_TIMEOUT - timeSinceBLEStart) / 1000;
+        }
+        break;
+      }
+      case POWER_LOW_POWER: {
+        unsigned long timeSinceMotion = currentTime - lastMotionTime;
+        unsigned long timeSinceButton = currentTime - lastButtonTime;
+        unsigned long timeSinceActivity = min(timeSinceMotion, timeSinceButton);
+        if (timeSinceActivity > LOW_POWER_TIMEOUT) {
+          sleepCountdown = 0; // Should be sleeping
+        } else {
+          sleepCountdown = (LOW_POWER_TIMEOUT - timeSinceActivity) / 1000;
+        }
+        break;
+      }
+      case POWER_BLE_ACTIVE:
+        sleepCountdown = 999; // No sleep when connected
+        break;
+      default:
+        sleepCountdown = 0;
+        break;
+    }
+    
+    // Get current yaw for status
+    float rawYaw = getYaw();
+    float currentRel = rawYaw + yawOffset;
+    while (currentRel > 180) currentRel -= 360;
+    while (currentRel < -180) currentRel += 360;
+    currentRel = constrain(currentRel, -40, 40);
+    float currentBin = round(currentRel/1.0f)*1.0f;
+    if (abs(currentBin) < 0.1f) currentBin = 0.0f;
+    
+    Serial.printf("STATUS: Yaw=%.1f° Bin=%.0f° BLE=%s | Screen=%ds Sleep=%ds Motion=%s Zwift=%s | Gyro=%.3f,%.3f,%.3f(%.3f°/s) Accel=%.2f,%.2f,%.2f | Freq=%.1f/%.1fHz %s Screen=%s CPU=%dMHz\n", 
+                  currentRel, currentBin, deviceConnected ? "Connected" : "Advertising",
+                  screenOffCountdown, sleepCountdown,
+                  (currentTime - lastMotionTime < 5000) ? "active" : "idle",
+                  zwiftConnected ? "active" : "idle",
+                  gx, gy, gz, gyroMagnitude, ax, ay, az, 
+                  loopfreq, currentIMUFrequency, powerModeStr,
+                  screenOn ? "ON" : "OFF", getCpuFrequencyMhz());
+    
+    
+    lastDebugTime = millis();
+  }
+
+  // Gyro drift monitoring - collect samples every second
+  if (millis() - lastDriftSampleTime >= 1000) {
+    addGyroDriftSample(gx, gy, gz);
+    lastDriftSampleTime = millis();
+  }
+
+  // Report drift average every 60 seconds
+  static unsigned long lastDriftReportTime = 0;
+  if (millis() - lastDriftReportTime >= 60000) {
+    reportGyroDriftAverage();
+    lastDriftReportTime = millis();
+  }
+
+  // Update Mahony AHRS with calibrated data (convert gyro to radians)
+  // The IMU data is already calibrated by the M5.Imu system
+  MahonyAHRSupdateIMU(
+    filteredGx * DEG_TO_RAD,
+    filteredGy * DEG_TO_RAD,
+    filteredGz * DEG_TO_RAD,
+    ax,
+    ay,
+    az,
+    currentIMUFrequency  // Use current frequency for consistent filter behavior
+  );
+
+  // Get yaw in degrees from Mahony AHRS
+  float rawYaw = getYaw();  // Already returns degrees in [-180, 180] range
+  
+  // Check for valid yaw value
+  if (isnan(rawYaw) || isinf(rawYaw)) {
+    Serial.println("WARNING: Invalid yaw value detected!");
+    rawYaw = 0.0f; // Use 0 as fallback
+  }
+  
+  // Calculate relative yaw: raw + offset
+  float rel = rawYaw + yawOffset;
+  
+  // Normalize relative yaw to [-180, 180] range
+  while (rel > 180) rel -= 360;
+  while (rel < -180) rel += 360;
+  
+  // Simple centering force - gradually adjust offset to bring rel back to 0
+  static unsigned long lastCenteringTime = millis();
+  unsigned long centeringTime = millis();
+  float deltaTime = (centeringTime - lastCenteringTime) / 1000.0f;
+  
+      if (deltaTime >= 1.0f) { // Update every 1 second for simplicity
+      // Apply centering force: if rel is positive, decrease offset; if negative, increase offset
+      // Use the configured YAW_DRIFT_RATE - now it's the actual rate per second
+      float centeringAdjustment = -rel * YAW_DRIFT_RATE * deltaTime;
+      
+      // Since we're updating every 1 second, the YAW_DRIFT_RATE is already the rate per second
+      // No need to scale - just constrain to prevent overcorrection
+      float maxAdjustmentPerUpdate = YAW_DRIFT_RATE; // Rate per second = rate per update when deltaTime = 1s
+      centeringAdjustment = constrain(centeringAdjustment, -maxAdjustmentPerUpdate, maxAdjustmentPerUpdate);
     
     yawOffset += centeringAdjustment;
     
@@ -999,416 +2104,160 @@ void updateSteering(unsigned long currentTime) {
     while (yawOffset > 180) yawOffset -= 360;
     while (yawOffset < -180) yawOffset += 360;
     
-    lastCenteringTime = currentTime;
-    
-    // Debug centering compensation occasionally
-    static unsigned long lastDebugTime = 0;
-    if (abs(centeringAdjustment) > 0.01f && currentTime - lastDebugTime > 5000) {
-      Serial.printf("Centering: rel=%.2f° rate=%.1f°/s adj=%.3f° newOffset=%.2f°\n", 
-                    rel, yawDriftRate, centeringAdjustment, yawOffset);
-      lastDebugTime = currentTime;
+    // Debug centering compensation
+    if (DEBUG_MODE && abs(centeringAdjustment) > 0.01f) {
+      float actualRatePerSecond = centeringAdjustment / deltaTime;
+      Serial.printf("Centering: rel=%.2f° target=%.1f°/s actual=%.3f°/s adj=%.3f° dt=%.1fs\n", 
+                    rel, YAW_DRIFT_RATE, actualRatePerSecond, centeringAdjustment, deltaTime);
     }
+    
+    lastCenteringTime = centeringTime;
   }
   
-  // Calculate final relative yaw for steering
-  float rel = rawYaw + yawOffset;
+  // Recalculate relative yaw with updated offset
+  rel = rawYaw + yawOffset;
   
-  // Normalize to [-180, 180]
+  // Normalize relative yaw to [-180, 180] range again
   while (rel > 180) rel -= 360;
   while (rel < -180) rel += 360;
   
   // Clamp to steering range and bin
   rel = constrain(rel, -40, 40);
   float bin = round(rel/1.0f)*1.0f;
-  if (abs(bin) < 0.1f) bin = 0.0f;
   
-  // Check for steering activity (bin changes indicate active steering)
-  if (!isnan(lastSentBin) && bin != lastSentBin) {
-    // Reset activity timer on any steering change (connected or not)
-    // Use the same currentTime from updateSteering to avoid timing issues
-    lastActivityTime = currentTime;
-    Serial.printf("Steering activity detected: bin %.0f° -> %.0f°\n", lastSentBin, bin);
-    
-    // Send steering data if connected
-    if (deviceConnected && challengeOK) {
-      sendSteeringBin(bin);
-    }
+  // Fix negative zero issue
+  if (abs(bin) < 0.1f) {
+    bin = 0.0f;
+  }
+
+  // Yaw status now included in consolidated status line above
+
+  // notify on true bin‐change
+  if (deviceConnected && ind32On && !isnan(lastSentBin) && bin!=lastSentBin) {
+    sendSteeringBin(bin);
   }
   lastSentBin = bin;
-}
 
-// —————— IMU Configuration ——————
-uint8_t getLPFRegisterValue(float frequency) {
-  // MPU6886 LPF register values for different frequencies
-  // Accelerometer: 5.1, 10.2, 21.2, 44.8, 99.0, 218.1, 420.0, 1046 Hz
-  // Gyroscope: 5, 10, 20, 41, 92, 176, 250, 3281, 8173 Hz
-  if (frequency <= 5.5f) return 0x06;      // ~5Hz
-  else if (frequency <= 15.0f) return 0x05; // ~10Hz  
-  else if (frequency <= 30.0f) return 0x04; // ~20Hz
-  else if (frequency <= 65.0f) return 0x03; // ~41-44Hz
-  else if (frequency <= 130.0f) return 0x02; // ~92-99Hz
-  else if (frequency <= 200.0f) return 0x01; // ~176-218Hz
-  else return 0x00; // ~250Hz+ (minimal filtering)
-}
+  // Update modern display with current status
+  float batteryVoltage = M5.Power.getBatteryVoltage() / 1000.0f;
+  drawModernDisplay(rel, deviceConnected, currentPowerMode, batteryVoltage, (int)loopfreq);
+  
+  // Log inactivity status periodically
+  logInactivityStatus();
 
-void configureIMU() {
-  Serial.printf("Configuring MPU6886 with %.1fHz low-pass filters...\n", IMU_LPF_FREQUENCY_HZ);
+  // —————— Button Handling ——————
+  static unsigned long buttonAStartTime = 0;
+  static unsigned long buttonBStartTime = 0;
+  static unsigned long buttonCStartTime = 0;
+  static bool buttonAWasPressed = false;
+  static bool buttonBWasPressed = false;
+  static bool buttonCWasPressed = false;
   
-  uint8_t lpfRegValue = getLPFRegisterValue(IMU_LPF_FREQUENCY_HZ);
+  // Button GPIO pins
+  const int BUTTON_A_PIN = 37;
+  const int BUTTON_B_PIN = 39;
+  const int BUTTON_C_PIN = 35;
   
-  // Set accelerometer LPF
-  Wire1.beginTransmission(0x68); // MPU6886_ADDRESS
-  Wire1.write(0x1D);             // MPU6886_ACCEL_CONFIG2
-  Wire1.write(lpfRegValue);      // LPF setting based on frequency
-  Wire1.endTransmission();
-  delay(1);
+  // Read button states directly from GPIO
+  bool buttonAState = !digitalRead(BUTTON_A_PIN); // Inverted logic
+  bool buttonBState = !digitalRead(BUTTON_B_PIN); // Inverted logic  
+  bool buttonCState = !digitalRead(BUTTON_C_PIN); // Inverted logic
   
-  // Set gyroscope LPF
-  Wire1.beginTransmission(0x68); // MPU6886_ADDRESS  
-  Wire1.write(0x1A);             // MPU6886_CONFIG
-  Wire1.write(lpfRegValue);      // LPF setting based on frequency
-  Wire1.endTransmission();
-  delay(1);
-  
-  // Fix sensor output limitation (recommended by datasheet)
-  Wire1.beginTransmission(0x68); // MPU6886_ADDRESS
-  Wire1.write(0x69);             // MPU6886_ACCEL_INTEL_CTRL
-  Wire1.write(0x02);             // Avoid limiting output to 0x7F7F
-  Wire1.endTransmission();
-  delay(1);
-  
-  Serial.printf("IMU configured: %.1fHz LPF (reg=0x%02X), Motion updates at %.1fHz\n", 
-                IMU_LPF_FREQUENCY_HZ, lpfRegValue, MOTION_UPDATE_FREQUENCY_HZ);
-}
-
-// —————— Sleep Functions ——————
-void goToSleep() {
-  Serial.println("\n=== Preparing for Deep Sleep ===");
-  
-  // Update gravity vector one final time before sleep
-  updateGravityVector();
-  
-  // Store current gravity vector as baseline for next wake
-  sleepGravityX = currentGravityX;
-  sleepGravityY = currentGravityY;
-  sleepGravityZ = currentGravityZ;
-  
-  Serial.printf("Storing sleep gravity vector: %.3f, %.3f, %.3f\n", 
-                sleepGravityX, sleepGravityY, sleepGravityZ);
-  
-  // Turn off screen and LED
-  turnOffScreen();
-  ledcWrite(0, 0); // Turn off LED
-  ledBreathingEnabled = false;
-  
-  // Stop BLE to save power
-  if (pServer) {
-    pServer->getAdvertising()->stop();
-  }
-  BLEDevice::deinit(false);
-  
-  // Configure GPIO4 HOLD to maintain power during deep sleep
-  pinMode(4, OUTPUT);
-  digitalWrite(4, HIGH);
-  gpio_hold_en(GPIO_NUM_4);
-  gpio_deep_sleep_hold_en();
-  Serial.println("GPIO4 HOLD configured for battery power");
-  
-  // Configure timer wake-up only
-  esp_sleep_enable_timer_wakeup(6000000ULL); // 6 seconds
-  Serial.println("Timer wake-up configured for 6 seconds");
-  
-  Serial.println("Entering deep sleep...");
-  Serial.flush();
-  
-  // Enter deep sleep
-  esp_deep_sleep_start();
-}
-
-// —————— Setup Function ——————
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n=== M5StickCPlus2 Simple Sterzo ===");
-  
-  // Power management: Set HOLD pin high to maintain power
-  pinMode(4, OUTPUT);
-  digitalWrite(4, HIGH);
-  Serial.println("HOLD pin set HIGH to maintain power");
-  
-  // Check wake-up reason
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  
-  // Initialize M5Unified
-  auto cfg = M5.config();
-  M5.begin(cfg);
-  
-  // Configure IMU for optimal steering performance
-  configureIMU();
-  
-  // Setup LED with PWM for breathing pattern
-  pinMode(LED_PIN, OUTPUT);
-  ledcSetup(0, 5000, 8);           // PWM channel 0, 5kHz frequency, 8-bit resolution
-  ledcAttachPin(LED_PIN, 0);       // Attach LED pin to PWM channel 0
-  ledBreathingStartTime = millis();
-  ledBreathingEnabled = true;
-  Serial.println("LED configured for breathing pattern");
-  
-  wakeCount++;
-  wakeUpTime = millis();
-  
-  // Initialize button pins
-  pinMode(37, INPUT_PULLUP); // Button A
-  pinMode(39, INPUT_PULLUP); // Button B
-  pinMode(35, INPUT_PULLUP); // Button C
-  
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-    timerWakeCount++;
-    isInActivityCheckMode = true;
-    lastActivityTime = 0;
+  // Button A (front face) - Short press (<2s): wake screen, Long press (>=2s): recenter
+  if (buttonAState && !buttonAWasPressed) {
+    buttonAStartTime = millis();
+    buttonAWasPressed = true;
+    lastButtonTime = millis(); // Update button activity
+    Serial.println("Button A pressed - resetting activity timer");
+  } else if (!buttonAState && buttonAWasPressed) {
+    unsigned long pressDuration = millis() - buttonAStartTime;
+    buttonAWasPressed = false;
     
-    // Keep display off for timer wake-ups
-    screenOn = false;
-    M5.Display.sleep();
-    
-    // Pulse LED to indicate wake-up
-    wakePulse();
-    
-    Serial.printf("=== Timer Wake #%d ===\n", timerWakeCount);
-    Serial.println("Checking for position change...");
-    
-    // Quick IMU stabilization
-    delay(50);
-    updateGravityVector();
-    delay(10);
-    updateGravityVector();
-    
-  } else {
-    // Fresh boot
-    Serial.printf("=== Fresh Boot #%d ===\n", wakeCount);
-    lastActivityTime = millis();
-    isInActivityCheckMode = false;
-    
-    // Initialize display for fresh boots
-    turnOnScreen();
-    showStatusMessage("ZTEERSTICK", "Starting...", ORANGE, 2000);
-    
-    // Full IMU stabilization
-    delay(1000);
-    for (int i = 0; i < 10; i++) {
-      updateGravityVector();
-      delay(100);
-    }
-    
-    // Load or perform calibration
-    if (!calibrationExists()) {
-      // First boot - no calibration exists
-      Serial.println("No calibration found - performing auto-calibration");
-      showStatusMessage("FIRST BOOT", "Auto-calibrating...", ORANGE, 2000);
-      performGyroCalibration();
-      
-      // Set initial yaw offset to 0
-      yawOffset = 0;
-      prefs.begin("sterzo", false);
-      prefs.putFloat("yoff", yawOffset);
-      prefs.end();
+    if (pressDuration < 1000) {
+      Serial.println("Button A: Short press - Waking screen");
+      if (!screenOn) {
+        exitScreenOffMode();
+      }
+      lastButtonTime = millis(); // Reset screen timer
     } else {
-      // Load existing calibration
-      Serial.println("Loading existing calibration data");
-      prefs.begin("sterzo", false);
-      gyroBiasX = prefs.getFloat("gxb", 0);
-      gyroBiasY = prefs.getFloat("gyb", 0);
-      gyroBiasZ = prefs.getFloat("gzb", 0);
-      yawOffset = prefs.getFloat("yoff", 0);
-      prefs.end();
-      
-      Serial.printf("Loaded calibration - Gyro: [%.3f,%.3f,%.3f] YawOffset: %.3f° DriftRate: %.2f°/s\n", 
-                    gyroBiasX, gyroBiasY, gyroBiasZ, yawOffset, yawDriftRate);
+      Serial.println("Button A: Long press - Recenter");
+      M5.Speaker.tone(800, 100);
+      quickRecenterYaw();
     }
-    
-    // Auto-zero yaw after boot (similar to wake due to activity)
-    Serial.println("Auto-zeroing yaw after boot for perfect center alignment");
-    showStatusMessage("ZTEERSTICK", "Zeroing yaw", GREEN, 1500);
-    delay(500); // Allow IMU to stabilize
-    float currentRawYaw = getYaw();
-    if (!isnan(currentRawYaw) && !isinf(currentRawYaw)) {
-      yawOffset = -currentRawYaw;
-      // Normalize offset to [-180, 180] range
-      while (yawOffset > 180) yawOffset -= 360;
-      while (yawOffset < -180) yawOffset += 360;
-      // Save to preferences
-      prefs.begin("sterzo", false);
-      prefs.putFloat("yoff", yawOffset);
-      prefs.end();
-      Serial.printf("Auto-zero on boot - Raw yaw: %.1f°, New offset: %.1f°\n", currentRawYaw, yawOffset);
-      //showStatusMessage("CENTERED!", "Ready to ride!", GREEN, 1500);
-    } else {
-      Serial.println("Warning: Could not auto-zero yaw - invalid yaw reading");
-      showStatusMessage("WARNING", "Yaw zero failed", YELLOW, 1500);
-    }
-    
-    // Initialize BLE
-    BLEDevice::init("STERZO");
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-    pSvc = pServer->createService(STERZO_SERVICE_UUID);
-    
-    pChar30 = pSvc->createCharacteristic(CHAR30_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-    pChar31 = pSvc->createCharacteristic(CHAR31_UUID, BLECharacteristic::PROPERTY_WRITE);
-    pChar32 = pSvc->createCharacteristic(CHAR32_UUID, BLECharacteristic::PROPERTY_INDICATE);
-    
-    BLE2902* p2902_30 = new BLE2902();
-    p2902_30->setNotifications(true);
-    pChar30->addDescriptor(p2902_30);
-    
-    BLE2902* p2902_32 = new BLE2902();
-    p2902_32->setCallbacks(new char32Desc2902Callbacks());
-    pChar32->addDescriptor(p2902_32);
-    
-    pChar31->setCallbacks(new char31Callbacks());
-    
-    pSvc->start();
-    
-    auto adv = BLEDevice::getAdvertising();
-    adv->addServiceUUID(STERZO_SERVICE_UUID);
-    adv->setScanResponse(true);
-    adv->setMinPreferred(0x06);
-    adv->setMinPreferred(0x12);
-    BLEDevice::startAdvertising();
-    
-    Serial.println("BLE advertising started");
-    
-    showStatusMessage("BLE", "Advertising", YELLOW, 2000);
   }
   
-  Serial.println("Setup complete");
+  // Button B (top/north face) - Short press (<2s): recenter, Long press (>=2s): full calibration
+  if (buttonBState && !buttonBWasPressed) {
+    buttonBStartTime = millis();
+    buttonBWasPressed = true;
+    lastButtonTime = millis(); // Update button activity
+    Serial.println("Button B pressed - resetting activity timer");
+  } else if (!buttonBState && buttonBWasPressed) {
+    unsigned long pressDuration = millis() - buttonBStartTime;
+    buttonBWasPressed = false;
+    
+    if (pressDuration < 2000) {
+      Serial.println("Button B: Short press - Recenter");
+      M5.Speaker.tone(1000, 100);
+      quickRecenterYaw();
+    } else {
+      Serial.println("Button B: Long press - Full calibration");
+      performFullCalibration();
+    }
+  }
+  
+  // Button C (Power button) - Power management
+  if (buttonCState && !buttonCWasPressed) {
+    buttonCStartTime = millis();
+    buttonCWasPressed = true;
+    lastButtonTime = millis(); // Update button activity
+    Serial.println("Button C pressed - resetting activity timer");
+  } else if (!buttonCState && buttonCWasPressed) {
+    unsigned long pressDuration = millis() - buttonCStartTime;
+    buttonCWasPressed = false;
+    
+    if (pressDuration < 1000) {
+      Serial.println("Button C: Short press - Wake screen");
+      M5.Speaker.tone(1200, 100);
+      
+      // Wake screen and reset timer
+      if (!screenOn) {
+        exitScreenOffMode();
+      }
+      lastButtonTime = millis(); // Reset screen timer
+    } else if (pressDuration >= 1000 && pressDuration < 2000) {
+      Serial.println("Button C: Medium press - Screen wake");
+      M5.Speaker.tone(1200, 100);
+      
+      // Wake screen and reset timer
+      if (!screenOn) {
+        exitScreenOffMode();
+      }
+      lastButtonTime = millis(); // Reset screen timer
+    } else if (pressDuration >= 2000) {
+      Serial.println("Button C: Long press - Power off");
+      
+      if (screenOn) {
+        M5.Display.clear();
+        M5.Display.setRotation(0);
+        M5.Display.setCursor(0, 25);
+        M5.Display.print("Powering");
+        M5.Display.setCursor(0, 40);
+        M5.Display.print("Off...");
+        delay(1000);
+      }
+      
+      // Try to power off
+      pinMode(4, OUTPUT);
+      digitalWrite(4, LOW);
+      Serial.println("HOLD pin set LOW for power off");
+      delay(2000);
+      
+      // If we get here, power off failed, so enter deep sleep
+      Serial.println("Power off failed, entering deep sleep");
+      enterULPSleep();
+    }
+  }
 }
 
-// —————— Main Loop ——————
-void loop() {
-  unsigned long currentTime = millis();
-  
-  // Update LED breathing pattern
-  updateLEDBreathing();
-  
-  // Update IMU and gravity vector
-  updateGravityVector();
-  
-  // Handle button presses for recenter/zero yaw functionality
-  handleButtonPresses();
-  
-  // Check for activity (simplified - removed duplicate motion detection)
-  // Position change uses dot product method - more reliable than motion rate detection
-  bool positionChanged = checkForPositionChange();
-  bool buttonActivity = checkForButtonActivity();
-  
-  // Handle activity detection
-  if (positionChanged || buttonActivity) {
-    lastActivityTime = currentTime;
-    wasActive = true;
-    
-    if (isInActivityCheckMode) {
-      Serial.println("Activity detected during check - Switching to monitoring mode");
-      isInActivityCheckMode = false;
-      activityWakeCount++;
-      
-      // Recenter yaw when waking from sleep due to activity
-      Serial.println("Auto-recentering yaw on wake from sleep");
-      float currentRawYaw = getYaw();
-      if (!isnan(currentRawYaw) && !isinf(currentRawYaw)) {
-        yawOffset = -currentRawYaw;
-        // Normalize offset to [-180, 180] range
-        while (yawOffset > 180) yawOffset -= 360;
-        while (yawOffset < -180) yawOffset += 360;
-        // Save to preferences
-        prefs.begin("sterzo", false);
-        prefs.putFloat("yoff", yawOffset);
-        prefs.end();
-        Serial.printf("Auto-recenter on wake - Raw yaw: %.1f°, New offset: %.1f°\n", currentRawYaw, yawOffset);
-      }
-      
-      // Turn on display and start BLE
-      turnOnScreen();
-      showStatusMessage("Waking up..", "Let's Ride!", GREEN, 2000);
-      
-      // Initialize BLE if not already done
-      if (!pServer) {
-        BLEDevice::init("STERZO");
-        pServer = BLEDevice::createServer();
-        pServer->setCallbacks(new MyServerCallbacks());
-        pSvc = pServer->createService(STERZO_SERVICE_UUID);
-        
-        pChar30 = pSvc->createCharacteristic(CHAR30_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-        pChar31 = pSvc->createCharacteristic(CHAR31_UUID, BLECharacteristic::PROPERTY_WRITE);
-        pChar32 = pSvc->createCharacteristic(CHAR32_UUID, BLECharacteristic::PROPERTY_INDICATE);
-        
-        BLE2902* p2902_30 = new BLE2902();
-        p2902_30->setNotifications(true);
-        pChar30->addDescriptor(p2902_30);
-        
-        BLE2902* p2902_32 = new BLE2902();
-        p2902_32->setCallbacks(new char32Desc2902Callbacks());
-        pChar32->addDescriptor(p2902_32);
-        
-        pChar31->setCallbacks(new char31Callbacks());
-        
-        pSvc->start();
-        
-        auto adv = BLEDevice::getAdvertising();
-        adv->addServiceUUID(STERZO_SERVICE_UUID);
-        adv->setScanResponse(true);
-        adv->setMinPreferred(0x06);
-        adv->setMinPreferred(0x12);
-        BLEDevice::startAdvertising();
-        
-        Serial.println("BLE advertising restarted");
-      }
-    }
-  }
-  
-  // Update steering if connected
-  updateSteering(currentTime);
-  
-  // Update display if screen is on
-  updateMainDisplay();
-  
-  // Determine sleep behavior
-  bool shouldSleep = false;
-  
-  if (isInActivityCheckMode) {
-    // In activity check mode
-    unsigned long checkTime = currentTime - wakeUpTime;
-    Serial.printf("Activity check mode: checkTime=%lums, duration=%lums, lastActivity=%lu\n", 
-                  checkTime, ACTIVITY_CHECK_DURATION, lastActivityTime);
-    
-    if (checkTime >= ACTIVITY_CHECK_DURATION) {
-      if (lastActivityTime == 0) {
-        Serial.println("Position check timeout - No movement detected, returning to sleep");
-        shouldSleep = true;
-      } else {
-        Serial.println("Position change found during check - Switching to monitoring mode");
-        isInActivityCheckMode = false;
-      }
-    }
-  } else {
-    // In normal monitoring mode
-    if (lastActivityTime > 0) {
-      unsigned long timeSinceActivity = currentTime - lastActivityTime;
-      Serial.printf("Monitoring mode: timeSinceActivity=%lums, timeout=%lums\n", 
-                    timeSinceActivity, ACTIVITY_TIMEOUT);
-      
-      if (timeSinceActivity >= ACTIVITY_TIMEOUT) {
-        Serial.println("Activity timeout reached - going to sleep");
-        shouldSleep = true;
-      }
-    }
-  }
-  
-  // Enter sleep if conditions are met
-  if (shouldSleep) {
-    goToSleep();
-  }
-  
-  // Small delay to prevent excessive CPU usage
-  delay(100);
-}
+
