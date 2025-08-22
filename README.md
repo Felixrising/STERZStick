@@ -1,7 +1,5 @@
 # STERZStick v1.0-RC1
 
-![M5StickC Plus2 Device](images/4_0977f4c6-d95d-49bd-8dc0-aa02c9464fd8_1200x1200.webp)
-
 A high-performance Zwift steering device using the M5StickCPlus2 with advanced IMU/AHRS implementation, power management, and BLE connectivity.
 
 > **Want your own M5StickC Plus2?** Get it here: [M5StickC Plus2 on AliExpress](https://s.click.aliexpress.com/e/_oocIGLh) *(affiliate link - supports further development)*
@@ -51,9 +49,13 @@ This project transforms your M5StickCPlus2 into a professional-grade steering co
 
 ## 🛠 Hardware Requirements
 
+<img src="images/4_0977f4c6-d95d-49bd-8dc0-aa02c9464fd8_1200x1200.webp" alt="M5StickC Plus2 Device" width="300" align="right" style="margin-left: 20px;">
+
 - **M5StickCPlus2** - Main device with built-in IMU (MPU6886)
 - **USB-C Cable** - For programming and charging
 - **Battery** - Built-in 200mAh LiPo battery
+
+The M5StickC Plus2 is a compact development board perfect for IoT projects. It features a built-in MPU6886 6-axis IMU, 1.14" color LCD display, and 200mAh battery - everything needed for this Zwift steering controller.
 
 ## 📦 Installation
 
