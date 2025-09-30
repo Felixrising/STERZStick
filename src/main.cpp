@@ -47,8 +47,9 @@ void enterScreenOffMode();
 void exitScreenOffMode();
 void enterULPSleep();
 void setupULPProgram();
-void wakePulse();
 void executeCentering();
+bool isSplashActive();
+void drawSplashContent();
 
 // —————— NEW IMU CALIBRATION SYSTEM ——————
 void startIMUCalibration();
@@ -177,8 +178,8 @@ unsigned long ledBreathingStartTime = 0;
 bool ledBreathingEnabled = true;
 
 // Motion detection with noise filtering
-const float MOTION_THRESHOLD = 40.0f; // degrees/second for gyro motion detection (increased for less sensitivity)
-const float ACCEL_MOTION_THRESHOLD = 0.8f; // g-force for accelerometer motion detection (increased for less sensitivity)
+const float MOTION_THRESHOLD = 10.0f; // degrees/second for gyro motion detection (increased for less sensitivity)
+const float ACCEL_MOTION_THRESHOLD = 0.2f; // g-force for accelerometer motion detection (increased for less sensitivity)
 float lastAccelMagnitude = 1.0f; // Initialize to 1g (gravity)
 float lastGyroMagnitude = 0.0f;
 float motionAccumulator = 0.0f;
@@ -210,11 +211,112 @@ static unsigned long overlayEndTime = 0;
 static String overlayText = "";
 static float smoothedBatteryVoltage = -1.0f; // For battery smoothing
 
-// Helper function to map battery voltage to percentage
+// Display brightness constants
+const int BRIGHTNESS_NORMAL = 6;    // 5% brightness for normal operation
+const int BRIGHTNESS_WAKE = 25;      // Higher brightness for boot/wake/alerts
+
+// Non-blocking splash overlay state
+struct SplashState {
+  bool active = false;
+  unsigned long startTime = 0;
+  unsigned long duration = 0;
+  String topText = "";
+  String imagePath = "";
+  String bottomText = "";
+} splashState;
+
+// Li-ion battery discharge curve lookup table
+// Based on typical 18650/21700 Li-ion characteristics under light load
+struct BatteryPoint {
+  float voltage;
+  float percentage;
+};
+
+const BatteryPoint liionCurve[] = {
+  {4.20f, 100.0f},  // Fully charged
+  {4.15f, 95.0f},   // Rapid initial drop
+  {4.11f, 90.0f},   
+  {4.08f, 85.0f},   
+  {4.02f, 80.0f},   // End of rapid drop
+  {3.98f, 70.0f},   // Plateau region starts
+  {3.95f, 60.0f},   
+  {3.91f, 50.0f},   
+  {3.87f, 40.0f},   
+  {3.82f, 30.0f},   // Plateau region ends
+  {3.79f, 25.0f},   
+  {3.77f, 20.0f},   // Knee point
+  {3.74f, 15.0f},   // Steep decline starts
+  {3.68f, 10.0f},   
+  {3.45f, 5.0f},    // Critical low
+  {3.27f, 2.0f},    // Very low
+  {3.20f, 0.0f}     // Cutoff voltage
+};
+
+const int curvePoints = sizeof(liionCurve) / sizeof(BatteryPoint);
+
+// Advanced Li-ion battery percentage calculation with interpolation
 int getBatteryPercentage(float voltage) {
-  // Simple linear mapping from 3.2V (empty) to 4.2V (full)
-  float percentage = (voltage - 3.2f) / (4.2f - 3.2f) * 100.0f;
-  return constrain((int)percentage, 0, 100);
+  // Clamp voltage to reasonable range
+  voltage = constrain(voltage, 3.0f, 4.3f);
+  
+  // Handle edge cases
+  if (voltage >= liionCurve[0].voltage) {
+    return 100; // Above max voltage
+  }
+  if (voltage <= liionCurve[curvePoints-1].voltage) {
+    return 0;   // Below cutoff voltage
+  }
+  
+  // Find the two points to interpolate between
+  for (int i = 0; i < curvePoints - 1; i++) {
+    if (voltage >= liionCurve[i + 1].voltage) {
+      // Interpolate between point i and i+1
+      float v1 = liionCurve[i].voltage;
+      float v2 = liionCurve[i + 1].voltage;
+      float p1 = liionCurve[i].percentage;
+      float p2 = liionCurve[i + 1].percentage;
+      
+      // Linear interpolation between the two points
+      float ratio = (voltage - v2) / (v1 - v2);
+      float percentage = p2 + ratio * (p1 - p2);
+      
+      return constrain((int)round(percentage), 0, 100);
+    }
+  }
+  
+  return 0; // Fallback
+}
+
+// Get battery status with voltage and health info
+struct BatteryInfo {
+  int percentage;
+  float voltage;
+  String status;
+  bool isCharging;
+  bool isLow;
+  bool isCritical;
+};
+
+BatteryInfo getBatteryInfo() {
+  BatteryInfo info;
+  info.voltage = M5.Power.getBatteryVoltage() / 1000.0f;
+  info.percentage = getBatteryPercentage(info.voltage);
+  info.isCharging = M5.Power.isCharging();
+  info.isLow = (info.percentage <= 15);
+  info.isCritical = (info.percentage <= 5);
+  
+  // Determine status string
+  if (info.isCharging) {
+    info.status = "CHG";
+  } else if (info.isCritical) {
+    info.status = "CRIT";
+  } else if (info.isLow) {
+    info.status = "LOW";
+  } else {
+    info.status = "OK";
+  }
+  
+  return info;
 }
 
 // —————— Utility: 32-bit rotate + hash ——————
@@ -431,13 +533,6 @@ void updateLEDBreathing() {
   }
 }
 
-void wakePulse() {
-  // Quick 50ms pulse at 10% brightness to indicate wake check
-  ledcWrite(0, 25); // 10% brightness
-  delay(50);
-  ledcWrite(0, 0);  // Turn off
-}
-
 // —————— INACTIVITY COUNTDOWN LOGGING ——————
 
 void logInactivityStatus() {
@@ -553,17 +648,37 @@ void initializeDisplayBuffer() {
 }
 
 void showOverlay(String text, int duration_ms) {
-  overlayText = text;
-  overlayEndTime = millis() + duration_ms;
+  // Only show overlay if splash is not active
+  // (Splash takes priority over overlays)
+  if (!isSplashActive()) {
+    overlayText = text;
+    overlayEndTime = millis() + duration_ms;
+  }
 }
 
-// Splash overlay display for startup/wake with configurable top text, center image, and bottom text
-void showSplashOverlay(String topText = "", String imagePath = "", String bottomText = "", int duration_ms = 2000) {
+// Start a non-blocking splash overlay
+void startSplashOverlay(String topText = "", String imagePath = "", String bottomText = "", int duration_ms = 2000) {
+  // Initialize splash state
+  splashState.active = true;
+  splashState.startTime = millis();
+  splashState.duration = duration_ms;
+  splashState.topText = topText;
+  splashState.imagePath = imagePath;
+  splashState.bottomText = bottomText;
+  
+  // Immediate display setup
   if (!screenOn) {
     M5.Display.wakeup();
-    M5.Display.setBrightness(13);
+    M5.Display.setBrightness(BRIGHTNESS_NORMAL);
+    screenOn = true;
   }
   
+  // Draw the splash immediately
+  drawSplashContent();
+}
+
+// Draw the splash overlay content (helper function)
+void drawSplashContent() {
   // Clear and setup display
   M5.Display.clear();
   M5.Display.setRotation(0);
@@ -575,14 +690,14 @@ void showSplashOverlay(String topText = "", String imagePath = "", String bottom
   int screenHeight = M5.Display.height();
   
   // Display top text (center-top justified)
-  if (topText.length() > 0) {
+  if (splashState.topText.length() > 0) {
     M5.Display.setTextDatum(TC_DATUM); // Top-Center
-    M5.Display.drawString(topText, screenCenterX, 10);
+    M5.Display.drawString(splashState.topText, screenCenterX, 10);
   }
   
   // Display center image from LittleFS
-  if (imagePath.length() > 0) {
-    String fullPath = "/" + imagePath;
+  if (splashState.imagePath.length() > 0) {
+    String fullPath = "/" + splashState.imagePath;
     if (LittleFS.exists(fullPath)) {
       // M5StickC Plus2 display has non-square pixels:
       // Pixel width: 0.1101 mm, Pixel height: 0.1038 mm
@@ -602,20 +717,56 @@ void showSplashOverlay(String topText = "", String imagePath = "", String bottom
       M5.Display.setTextDatum(MC_DATUM); // Middle-Center
       M5.Display.setTextSize(1);
       M5.Display.drawString("Image not found:", screenCenterX, screenHeight / 2 - 10);
-      M5.Display.drawString(imagePath, screenCenterX, screenHeight / 2 + 10);
+      M5.Display.drawString(splashState.imagePath, screenCenterX, screenHeight / 2 + 10);
       M5.Display.setTextSize(2); // Reset text size
     }
   }
   
   // Display bottom text (center-bottom justified)
-  if (bottomText.length() > 0) {
+  if (splashState.bottomText.length() > 0) {
     M5.Display.setTextDatum(BC_DATUM); // Bottom-Center
-    M5.Display.drawString(bottomText, screenCenterX, screenHeight - 10);
+    M5.Display.drawString(splashState.bottomText, screenCenterX, screenHeight - 10);
   }
+}
+
+// Update splash overlay state (call from main loop)
+void updateSplashOverlay() {
+  if (!splashState.active) return;
   
-  if (duration_ms > 0) {
-    delay(duration_ms);
+  // Check if splash duration has expired
+  if (millis() - splashState.startTime >= splashState.duration) {
+    splashState.active = false;
+    // Clear splash state
+    splashState.topText = "";
+    splashState.imagePath = "";
+    splashState.bottomText = "";
   }
+}
+
+// Check if splash overlay is currently active
+bool isSplashActive() {
+  return splashState.active;
+}
+
+// Safe display clear - respects active splash
+void safeDisplayClear() {
+  if (isSplashActive()) {
+    // Don't clear - redraw splash instead
+    drawSplashContent();
+  } else {
+    M5.Display.clear();
+  }
+}
+
+// Safe display operations - check for active splash first
+bool canDrawToDisplay() {
+  return !isSplashActive();
+}
+
+// Legacy blocking function for compatibility (calls non-blocking version)
+void showSplashOverlay(String topText = "", String imagePath = "", String bottomText = "", int duration_ms = 2000) {
+  startSplashOverlay(topText, imagePath, bottomText, duration_ms);
+  // Note: No delay() - now non-blocking!
 }
 
 void clearOverlay() {
@@ -633,13 +784,22 @@ void drawModernDisplay(float yaw, bool connected, PowerMode powerMode, float bat
     return;
   }
   
+  // If splash overlay is active, don't draw normal display
+  if (isSplashActive()) {
+    lastDisplayUpdate = millis();
+    return;
+  }
+  
   int yawInt = round(yaw);
+  
+  // Get comprehensive battery information
+  BatteryInfo batteryInfo = getBatteryInfo();
   
   // Smooth battery voltage reading
   if (smoothedBatteryVoltage < 0) {
-    smoothedBatteryVoltage = battery;
+    smoothedBatteryVoltage = batteryInfo.voltage;
   } else {
-    smoothedBatteryVoltage = smoothedBatteryVoltage * 0.9f + battery * 0.1f;
+    smoothedBatteryVoltage = smoothedBatteryVoltage * 0.9f + batteryInfo.voltage * 0.1f;
   }
   int batteryPercentage = getBatteryPercentage(smoothedBatteryVoltage);
 
@@ -693,17 +853,49 @@ void drawModernDisplay(float yaw, bool connected, PowerMode powerMode, float bat
 
   // --- Battery Icon and Percentage ---
   displaySprite.setTextDatum(TR_DATUM); // Top-Right
-  displaySprite.setTextColor(TFT_WHITE);
+  
+  // Color based on battery status
+  uint16_t batteryColor = TFT_WHITE;
+  if (batteryInfo.isCharging) {
+    batteryColor = TFT_CYAN;  // Cyan when charging
+  } else if (batteryInfo.isCritical) {
+    batteryColor = TFT_RED;   // Red when critical
+  } else if (batteryInfo.isLow) {
+    batteryColor = TFT_ORANGE; // Orange when low
+  }
+  
+  displaySprite.setTextColor(batteryColor);
   String battStr = String(batteryPercentage) + "%";
+  if (batteryInfo.isCharging) {
+    battStr += "+"; // Show charging indicator
+  }
   displaySprite.drawString(battStr, 110, 22);
   
   // Draw battery icon outline
-  displaySprite.drawRect(115, 20, 18, 10, TFT_WHITE);
-  displaySprite.fillRect(133, 23, 2, 4, TFT_WHITE);
+  displaySprite.drawRect(115, 20, 18, 10, batteryColor);
+  displaySprite.fillRect(133, 23, 2, 4, batteryColor);
 
-  // Draw battery level
+  // Draw battery level with appropriate color
   int batteryLevelWidth = map(batteryPercentage, 0, 100, 0, 14);
-  displaySprite.fillRect(117, 22, batteryLevelWidth, 6, (batteryPercentage < 20) ? TFT_RED : TFT_GREEN);
+  uint16_t fillColor;
+  if (batteryInfo.isCharging) {
+    fillColor = TFT_CYAN;
+  } else if (batteryPercentage < 5) {
+    fillColor = TFT_RED;
+  } else if (batteryPercentage < 15) {
+    fillColor = TFT_ORANGE;
+  } else {
+    fillColor = TFT_GREEN;
+  }
+  
+  if (batteryLevelWidth > 0) {
+    displaySprite.fillRect(117, 22, batteryLevelWidth, 6, fillColor);
+  }
+  
+  // Add charging animation (flashing effect)
+  if (batteryInfo.isCharging && (millis() / 500) % 2 == 0) {
+    displaySprite.fillRect(117, 22, 14, 6, TFT_CYAN); // Full flash when charging
+  }
 
   // Main Yaw Value
   displaySprite.setFont(&fonts::Font7);
@@ -799,8 +991,10 @@ void drawModernDisplay(float yaw, bool connected, PowerMode powerMode, float bat
     displaySprite.drawString(overlayText, displaySprite.width() / 2, 60);
   }
 
-  // --- Push Buffer to Screen ---
-  displaySprite.pushSprite(0, 0);
+  // --- Push Buffer to Screen (only if splash not active) ---
+  if (canDrawToDisplay()) {
+    displaySprite.pushSprite(0, 0);
+  }
 
   // Update tracking variables
   lastDisplayedYaw = yaw;
@@ -863,22 +1057,45 @@ void startBLE() {
   // Configure BLE for low power
   esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
   bt_cfg.mode = ESP_BT_MODE_BLE; // BLE only mode
-  esp_bt_controller_init(&bt_cfg);
-  esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  
+  esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+  if (ret != ESP_OK) {
+    Serial.printf("ERROR: BT controller init failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+    return;
+  }
+  
+  ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+  if (ret != ESP_OK) {
+    Serial.printf("ERROR: BT controller enable failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+    esp_bt_controller_deinit();
+    return;
+  }
   
   // Ensure CPU is at 80MHz for BLE
   setCpuFrequencyMhz(BLE_CPU_FREQ);
   
-  Serial.println("BLE started, CPU at 80MHz");
+  Serial.println("BLE started successfully, CPU at 80MHz");
 }
 
 void stopBLE() {
   Serial.println("Stopping BLE to save power...");
   
   // Stop BLE advertising and disable controller
-  BLEDevice::deinit(false);
-  esp_bt_controller_disable();
-  esp_bt_controller_deinit();
+  try {
+    BLEDevice::deinit(false);
+  } catch (const std::exception& e) {
+    Serial.printf("WARNING: BLEDevice::deinit() failed: %s\n", e.what());
+  }
+  
+  esp_err_t ret = esp_bt_controller_disable();
+  if (ret != ESP_OK) {
+    Serial.printf("WARNING: BT controller disable failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+  }
+  
+  ret = esp_bt_controller_deinit();
+  if (ret != ESP_OK) {
+    Serial.printf("WARNING: BT controller deinit failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+  }
   
   Serial.println("BLE stopped");
 }
@@ -963,10 +1180,10 @@ void exitScreenOffMode() {
     
     // Wake up display
     M5.Display.wakeup();
-    M5.Display.setBrightness(13); // 5% brightness (13/255 ≈ 5%)
+    M5.Display.setBrightness(BRIGHTNESS_NORMAL); // 5% brightness for normal operation
     screenOn = true;
     
-    Serial.println("Screen on at 5% brightness");
+    Serial.println("Screen on at normal brightness");
   }
 }
 
@@ -975,7 +1192,7 @@ void enterULPSleep() {
   
   // Show sleep message on screen briefly
   M5.Display.wakeup();
-  M5.Display.setBrightness(50);
+  M5.Display.setBrightness(BRIGHTNESS_WAKE);
   M5.Display.clear();
   M5.Display.setRotation(0);
   M5.Display.setTextColor(ORANGE);
@@ -1041,10 +1258,15 @@ void handleWakeupFromSleep() {
   
   // Always turn on screen and show wake reason prominently
   M5.Display.wakeup();
-  M5.Display.setBrightness(50); // Higher brightness for wake display
-  M5.Display.clear();
+  M5.Display.setBrightness(BRIGHTNESS_WAKE); // Higher brightness for wake display
+  safeDisplayClear(); // Respect active splash
   M5.Display.setRotation(0);
   //showSplashOverlay("Starting up", "", "", 1500);
+  
+  // Switch back to normal brightness after wake display
+//  delay(1500); // Brief pause to show wake reason
+  M5.Display.setBrightness(BRIGHTNESS_NORMAL);
+  Serial.printf("Wake complete - brightness set to normal level (%d)\n", BRIGHTNESS_NORMAL);
   
   enterBLEWaitingMode();
   }
@@ -1159,36 +1381,31 @@ class MyServerCallbacks : public BLEServerCallbacks {
     }
     lastButtonTime = millis(); // Reset screen timer for 1 minute display
     
-    // Show connection success message
-    M5.Display.clear();
-    M5.Display.setRotation(0);
-    M5.Display.setTextColor(0x07E0); // GREEN
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(10, 20);
-    M5.Display.print("BLE");
-    M5.Display.setCursor(10, 45);
-    M5.Display.print("CONNECTED");
-    M5.Display.setTextColor(0xFFFF); // WHITE
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(10, 80);
-    M5.Display.print("Screen on for 1min");
+    // Show connection success message (only if splash not active)
+    if (canDrawToDisplay()) {
+      M5.Display.clear();
+      M5.Display.setRotation(0);
+      M5.Display.setTextColor(0x07E0); // GREEN
+      M5.Display.setTextSize(2);
+      M5.Display.setCursor(10, 20);
+      M5.Display.print("BLE");
+      M5.Display.setCursor(10, 45);
+      M5.Display.print("CONNECTED");
+      M5.Display.setTextColor(0xFFFF); // WHITE
+      M5.Display.setTextSize(1);
+      M5.Display.setCursor(10, 80);
+      M5.Display.print("Screen on for 1min");
+    }
     
     showOverlay("CONNECTED", 1500);
-    
-    // Success beep pattern
-    M5.Speaker.tone(800, 100);
-    delay(150);
-    M5.Speaker.tone(1000, 100);
-    delay(150);
-    M5.Speaker.tone(1200, 150);
   }
   void onDisconnect (BLEServer* s) override {
     deviceConnected = false;
     zwiftConnected = false; // Reset Zwift connection status
     Serial.println("BLE client disconnected");
     
-    // Show disconnection message if screen is on
-    if (screenOn) {
+    // Show disconnection message if screen is on and splash not active
+    if (screenOn && canDrawToDisplay()) {
       M5.Display.clear();
       M5.Display.setRotation(0);
       M5.Display.setTextColor(0xF800); // RED
@@ -1201,13 +1418,11 @@ class MyServerCallbacks : public BLEServerCallbacks {
       M5.Display.setTextSize(1);
       M5.Display.setCursor(10, 80);
       M5.Display.print("Advertising...");
-      
+    }
+    
+    // Always show overlay (it handles priority internally)
+    if (screenOn) {
       showOverlay("DISCONNECTED", 1500);
-      
-      // Disconnection beep
-      M5.Speaker.tone(600, 200);
-      delay(300);
-      M5.Speaker.tone(400, 200);
     }
   }
 };
@@ -1225,16 +1440,25 @@ class char31Callbacks : public BLECharacteristicCallbacks {
     if (val.size()>=2 && val[0]==0x03 && val[1]==0x10) {
       Serial.println("→ got 0x310, sending initial challenge");
       uint8_t chal[4] = {0x03,0x10,0x12,0x34};
-      pChar32->setValue(chal,4);
-      pChar32->indicate();
-      zwiftConnected = false; // Reset on new handshake attempt
+      try {
+        pChar32->setValue(chal,4);
+        pChar32->indicate();
+        zwiftConnected = false; // Reset on new handshake attempt
+      } catch (const std::exception& e) {
+        Serial.printf("ERROR: Failed to send initial challenge: %s\n", e.what());
+      }
     }
     else if (val.size()>=2 && val[0]==0x03 && val[1]==0x11) {
       Serial.println("→ got 0x311, marking challengeOK");
       challengeOK = true;
       uint8_t resp[4] = {0x03,0x11,0xFF,0xFF};
-      pChar32->setValue(resp,4);
-      pChar32->indicate();
+      try {
+        pChar32->setValue(resp,4);
+        pChar32->indicate();
+      } catch (const std::exception& e) {
+        Serial.printf("ERROR: Failed to send 0x311 response: %s\n", e.what());
+        challengeOK = false;
+      }
     }
     else if (val.size()>=6 && val[0]==0x03 && val[1]==0x12) {
       // client has sent seed bytes in val[2..5]
@@ -1250,17 +1474,27 @@ class char31Callbacks : public BLECharacteristicCallbacks {
       res[3]=(pwd >>  8) & 0xFF;
       res[4]=(pwd >> 16) & 0xFF;
       res[5]=(pwd >> 24) & 0xFF;
-      pChar32->setValue(res,6);
-      pChar32->indicate();
+      try {
+        pChar32->setValue(res,6);
+        pChar32->indicate();
+      } catch (const std::exception& e) {
+        Serial.printf("ERROR: Failed to send 0x312 response: %s\n", e.what());
+      }
     }
     else if (val.size()>=2 && val[0]==0x03 && val[1]==0x13) {
       Serial.println("→ got 0x313, final ACK");
       uint8_t r[3] = {0x03,0x13,0xFF};
-      pChar32->setValue(r,3);
-      pChar32->indicate();
-      challengeOK = true;
-      zwiftConnected = true; // Mark as actively connected to Zwift
-      Serial.println("Zwift connection established - keeping screen on indefinitely");
+      try {
+        pChar32->setValue(r,3);
+        pChar32->indicate();
+        challengeOK = true;
+        zwiftConnected = true; // Mark as actively connected to Zwift
+        Serial.println("Zwift connection established - keeping screen on indefinitely");
+      } catch (const std::exception& e) {
+        Serial.printf("ERROR: Failed to send final ACK: %s\n", e.what());
+        challengeOK = false;
+        zwiftConnected = false;
+      }
     }
   }
 };
@@ -1279,9 +1513,13 @@ class char32Desc2902Callbacks : public BLEDescriptorCallbacks {
 
 // —————— Helpers ——————
 void sendSteeringBin(float bin) {
-  pChar30->setValue((uint8_t*)&bin, sizeof(bin));
-  pChar30->notify();
-  Serial.printf("NOTIFY bin: %.0f°\n", bin);
+  try {
+    pChar30->setValue((uint8_t*)&bin, sizeof(bin));
+    pChar30->notify();
+    Serial.printf("NOTIFY bin: %.0f°\n", bin);
+  } catch (const std::exception& e) {
+    Serial.printf("ERROR: Failed to send steering bin %.0f°: %s\n", bin, e.what());
+  }
 }
 
 // —————— Calibration Functions ——————
@@ -1455,7 +1693,7 @@ void recenterYaw() {
 void performAutoCalibration() {
   Serial.println("=== AUTO CALIBRATION ===");
   
-  if (screenOn) {
+  if (screenOn && canDrawToDisplay()) {
     M5.Display.clear();
     M5.Display.setRotation(0);
     M5.Display.setCursor(0, 10);
@@ -1683,13 +1921,13 @@ void setup() {
   setCpuFrequencyMhz(BLE_CPU_FREQ);
   Serial.printf("CPU frequency set to %d MHz for BLE\n", BLE_CPU_FREQ);
   
-  // Initialize display with 5% brightness
+  // Initialize display with wake brightness initially 
   M5.Display.setRotation(0);
   M5.Display.setTextColor(ORANGE);
   M5.Display.setTextDatum(0);
   M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextSize(2);
-  M5.Display.setBrightness(13); // 5% brightness (13/255 ≈ 5%)
+  M5.Display.setBrightness(BRIGHTNESS_WAKE); // Higher brightness for startup
   screenOn = true;
   lastButtonTime = millis(); // Screen starts on
   
@@ -1697,7 +1935,7 @@ void setup() {
   initializeDisplayBuffer();
   
 
-  showSplashOverlay("STERZStick", "logo.jpg", "Let's ride!", 2000);
+  startSplashOverlay("STERZStick", "logo.jpg", "LETZride!", 2000);
   
   Serial.println("Display configured at 5% brightness with modern UI");
   
@@ -1828,57 +2066,89 @@ void setup() {
   // Start BLE for initial connection attempts
   startBLE();
   
-  BLEDevice::init("STERZO");
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-  pSvc = pServer->createService(STERZO_SERVICE_UUID);
+  try {
+    BLEDevice::init("STERZO");
+    pServer = BLEDevice::createServer();
+    if (!pServer) {
+      Serial.println("ERROR: Failed to create BLE server");
+      return;
+    }
+    
+    pServer->setCallbacks(new MyServerCallbacks());
+    pSvc = pServer->createService(STERZO_SERVICE_UUID);
+    if (!pSvc) {
+      Serial.println("ERROR: Failed to create BLE service");
+      return;
+    }
+  } catch (const std::exception& e) {
+    Serial.printf("ERROR: BLE initialization failed: %s\n", e.what());
+    return;
+  }
   
-  pChar14 = pSvc->createCharacteristic(CHAR14_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-  pChar30 = pSvc->createCharacteristic(CHAR30_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-  pChar31 = pSvc->createCharacteristic(CHAR31_UUID, BLECharacteristic::PROPERTY_WRITE);
-  pChar32 = pSvc->createCharacteristic(CHAR32_UUID, BLECharacteristic::PROPERTY_INDICATE);
-  
-  p2902_14 = new BLE2902();          pChar14->addDescriptor(p2902_14);
-  p2902_30 = new BLE2902(); p2902_30->setNotifications(true); pChar30->addDescriptor(p2902_30);
-  p2902_32 = new BLE2902(); p2902_32->setCallbacks(new char32Desc2902Callbacks()); pChar32->addDescriptor(p2902_32);
+  try {
+    pChar14 = pSvc->createCharacteristic(CHAR14_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    pChar30 = pSvc->createCharacteristic(CHAR30_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    pChar31 = pSvc->createCharacteristic(CHAR31_UUID, BLECharacteristic::PROPERTY_WRITE);
+    pChar32 = pSvc->createCharacteristic(CHAR32_UUID, BLECharacteristic::PROPERTY_INDICATE);
+    
+    if (!pChar14 || !pChar30 || !pChar31 || !pChar32) {
+      Serial.println("ERROR: Failed to create one or more BLE characteristics");
+      return;
+    }
+    
+    p2902_14 = new BLE2902();          pChar14->addDescriptor(p2902_14);
+    p2902_30 = new BLE2902(); p2902_30->setNotifications(true); pChar30->addDescriptor(p2902_30);
+    p2902_32 = new BLE2902(); p2902_32->setCallbacks(new char32Desc2902Callbacks()); pChar32->addDescriptor(p2902_32);
 
-  pChar31->setCallbacks(new char31Callbacks());
-  pChar32->setCallbacks(new char32Callbacks());
+    pChar31->setCallbacks(new char31Callbacks());
+    pChar32->setCallbacks(new char32Callbacks());
 
-  pSvc->start();
-  auto adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(STERZO_SERVICE_UUID);
-  adv->setScanResponse(true);
-  adv->setMinPreferred(0x06);
-  adv->setMinPreferred(0x12);
-  
-  // Configure BLE advertising for low power
-  adv->setMinInterval(800);  // Longer intervals for power saving
-  adv->setMaxInterval(1600);
-  
-  BLEDevice::startAdvertising();
+    pSvc->start();
+    
+    auto adv = BLEDevice::getAdvertising();
+    if (!adv) {
+      Serial.println("ERROR: Failed to get BLE advertising object");
+      return;
+    }
+    
+    adv->addServiceUUID(STERZO_SERVICE_UUID);
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x06);
+    adv->setMinPreferred(0x12);
+    
+    // Configure BLE advertising for low power
+    adv->setMinInterval(800);  // Longer intervals for power saving
+    adv->setMaxInterval(1600);
+    
+    BLEDevice::startAdvertising();
+    
+  } catch (const std::exception& e) {
+    Serial.printf("ERROR: BLE characteristic/advertising setup failed: %s\n", e.what());
+    return;
+  }
   
   Serial.println("BLE advertising started - waiting for connection");
 
-  // IMU wake-on-motion removed - using button-only wake
+  // Display startup message (only if splash not active)
+  if (canDrawToDisplay()) {
+    M5.Display.clear();
+    M5.Display.setRotation(0);  
+    M5.Display.setCursor(10, 20);
+    M5.Display.print("STERZStick");
+    M5.Display.setCursor(10, 50);
+    M5.Display.print("Ready!");
+  }
 
-  // Display startup message
-  M5.Display.clear();
-  M5.Display.setRotation(0);  
-  M5.Display.setCursor(10, 20);
-  M5.Display.print("STERZStick");
-  M5.Display.setCursor(10, 50);
-  M5.Display.print("Ready!");
-  M5.Display.setCursor(10, 80);
-  M5.Display.printf("10Hz IMU");
-  M5.Display.setCursor(10, 110);
-  M5.Display.printf("5%% Screen");
   
   Serial.println("=== STERZStick READY ===");
   
   // Clear the startup message and prepare for the main display
   displaySprite.fillSprite(TFT_BLACK);
   displaySprite.pushSprite(0, 0);
+  
+  // Switch to normal brightness after startup sequence
+  M5.Display.setBrightness(BRIGHTNESS_NORMAL);
+  Serial.printf("Display brightness set to normal level (%d)\n", BRIGHTNESS_NORMAL);
 
   // Note: Wake-up handling now manages power modes directly
   // No immediate return to sleep needed as wake handler sets appropriate mode
@@ -1889,6 +2159,9 @@ void loop() {
 
   // Update LED breathing pattern
   updateLEDBreathing();
+
+  // Update non-blocking splash overlay
+  updateSplashOverlay();
 
   // Handle non-blocking centering process
   updateCentering();
@@ -2139,8 +2412,8 @@ void loop() {
   lastSentBin = bin;
 
   // Update modern display with current status
-  float batteryVoltage = M5.Power.getBatteryVoltage() / 1000.0f;
-  drawModernDisplay(rel, deviceConnected, currentPowerMode, batteryVoltage, (int)loopfreq);
+  BatteryInfo currentBattery = getBatteryInfo();
+  drawModernDisplay(rel, deviceConnected, currentPowerMode, currentBattery.voltage, (int)loopfreq);
   
   // Log inactivity status periodically
   logInactivityStatus();
