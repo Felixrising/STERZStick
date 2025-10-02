@@ -1,4 +1,4 @@
-# STERZStick v1.0-RC1
+# STERZStick v1.0-RC2
 
 A high-performance Zwift steering device using the M5StickCPlus2 with advanced IMU/AHRS implementation, power management, and BLE connectivity.
 
@@ -218,6 +218,42 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - ✅ **Calibration System** - Comprehensive and user-friendly
 - 🔄 **Documentation** - Ongoing improvements
 - 🔄 **Testing** - Continuous validation with Zwift updates
+
+## 📝 Changelog
+
+### v1.0-RC2 (Current Release)
+**Major Power Optimization & Performance Release**
+
+**Power Optimizations:**
+- 🔋 Reduced LOW_POWER_CPU_FREQ from 80MHz to 10MHz (significant power savings)
+- 🔋 LED breathing rate-limited to 20Hz (50ms intervals) for power savings
+- 🔋 Adaptive display refresh: 10 FPS active, 5 FPS idle BLE, 1 FPS disconnected
+- 🔋 Battery ADC reads now cached for 1 second instead of every frame
+- 🔋 Debug logging conditionally compiled with `#ifdef DEBUG_MODE`
+- 🔋 Replaced `delayMicroseconds()` busy-wait with `vTaskDelay()` for power-efficient sleep
+
+**Performance Improvements:**
+- ⚡ BLE controller state checking prevents redundant init/enable calls
+- ⚡ Splash overlay uses char arrays instead of String objects (stack vs heap allocation)
+- ⚡ Smart display refresh only when content actually changes
+- ⚡ Button press duration constants now defined for maintainability
+
+**Bug Fixes:**
+- 🐛 Fixed BLE controller conflicts when switching between power modes
+- 🐛 Corrected splash screen string handling for better memory efficiency
+- 🐛 Improved motion detection threshold accuracy
+
+**Expected Impact:**
+- 30-50% longer battery life in low power modes
+- Smoother display updates during active use
+- More reliable BLE connection management
+- Reduced memory fragmentation
+
+### v1.0-RC1
+- Added LittleFS support for splash screen images
+- Enhanced splash screen system with logo display
+- Improved startup sequence
+- Repository renamed from ZTEERStick to STERZStick
 
 ---
 
