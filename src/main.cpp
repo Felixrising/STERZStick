@@ -170,12 +170,16 @@ float currentIMUFrequency = NORMAL_IMU_FREQUENCY;
 
 // CPU frequency management
 const int BLE_CPU_FREQ = 80;         // 80MHz minimum for BLE operation
-const int LOW_POWER_CPU_FREQ = 80;   // 80MHz for I2C/IMU/button checks (no BLE)
+const int LOW_POWER_CPU_FREQ = 10;   // 10MHz for I2C/IMU/button checks (no BLE) - POWER OPTIMIZED
 const int DEEP_SLEEP_CPU_FREQ = 80;  // 80MHz for ULP wake checks
 
 // LED breathing pattern
 unsigned long ledBreathingStartTime = 0;
 bool ledBreathingEnabled = true;
+
+// Button press duration constants (milliseconds)
+const unsigned long BUTTON_SHORT_PRESS_MS = 1000;  // Short press threshold
+const unsigned long BUTTON_LONG_PRESS_MS = 2000;   // Long press threshold
 
 // Motion detection with noise filtering
 const float MOTION_THRESHOLD = 10.0f; // degrees/second for gyro motion detection (increased for less sensitivity)
@@ -215,14 +219,14 @@ static float smoothedBatteryVoltage = -1.0f; // For battery smoothing
 const int BRIGHTNESS_NORMAL = 6;    // 5% brightness for normal operation
 const int BRIGHTNESS_WAKE = 25;      // Higher brightness for boot/wake/alerts
 
-// Non-blocking splash overlay state
+// Non-blocking splash overlay state (optimized with char arrays instead of String objects)
 struct SplashState {
   bool active = false;
   unsigned long startTime = 0;
   unsigned long duration = 0;
-  String topText = "";
-  String imagePath = "";
-  String bottomText = "";
+  char topText[32] = "";      // Stack allocation, fixed size (more efficient)
+  char imagePath[32] = "";
+  char bottomText[32] = "";
 } splashState;
 
 // Li-ion battery discharge curve lookup table
@@ -506,7 +510,11 @@ void updateLEDBreathing() {
     return;
   }
   
+  // Rate limit LED updates to 20Hz for power savings
+  static unsigned long lastLEDUpdate = 0;
   unsigned long currentTime = millis();
+  if (currentTime - lastLEDUpdate < 50) return; // 20Hz max (50ms interval)
+  lastLEDUpdate = currentTime;
   
   // Different breathing patterns based on connection state
   float breathingPeriod;
@@ -657,14 +665,14 @@ void showOverlay(String text, int duration_ms) {
 }
 
 // Start a non-blocking splash overlay
-void startSplashOverlay(String topText = "", String imagePath = "", String bottomText = "", int duration_ms = 2000) {
+void startSplashOverlay(const char* topText = "", const char* imagePath = "", const char* bottomText = "", int duration_ms = 2000) {
   // Initialize splash state
   splashState.active = true;
   splashState.startTime = millis();
   splashState.duration = duration_ms;
-  splashState.topText = topText;
-  splashState.imagePath = imagePath;
-  splashState.bottomText = bottomText;
+  strncpy(splashState.topText, topText, sizeof(splashState.topText) - 1);
+  strncpy(splashState.imagePath, imagePath, sizeof(splashState.imagePath) - 1);
+  strncpy(splashState.bottomText, bottomText, sizeof(splashState.bottomText) - 1);
   
   // Immediate display setup
   if (!screenOn) {
@@ -690,14 +698,15 @@ void drawSplashContent() {
   int screenHeight = M5.Display.height();
   
   // Display top text (center-top justified)
-  if (splashState.topText.length() > 0) {
+  if (strlen(splashState.topText) > 0) {
     M5.Display.setTextDatum(TC_DATUM); // Top-Center
     M5.Display.drawString(splashState.topText, screenCenterX, 10);
   }
   
   // Display center image from LittleFS
-  if (splashState.imagePath.length() > 0) {
-    String fullPath = "/" + splashState.imagePath;
+  if (strlen(splashState.imagePath) > 0) {
+    char fullPath[40];
+    snprintf(fullPath, sizeof(fullPath), "/%s", splashState.imagePath);
     if (LittleFS.exists(fullPath)) {
       // M5StickC Plus2 display has non-square pixels:
       // Pixel width: 0.1101 mm, Pixel height: 0.1038 mm
@@ -711,7 +720,7 @@ void drawSplashContent() {
       // Draw the image with aspect ratio correction using scale_x and scale_y
       // scale_x = 1.0 (no horizontal scaling)
       // scale_y = 1.061 (stretch vertically to compensate for non-square pixels)
-      M5.Display.drawJpgFile(LittleFS, fullPath.c_str(), imageX, imageY, 0, 0, 0, 0, 1.0f, 1.061f);
+      M5.Display.drawJpgFile(LittleFS, fullPath, imageX, imageY, 0, 0, 0, 0, 1.0f, 1.061f);
     } else {
       // If image doesn't exist, show placeholder text
       M5.Display.setTextDatum(MC_DATUM); // Middle-Center
@@ -723,7 +732,7 @@ void drawSplashContent() {
   }
   
   // Display bottom text (center-bottom justified)
-  if (splashState.bottomText.length() > 0) {
+  if (strlen(splashState.bottomText) > 0) {
     M5.Display.setTextDatum(BC_DATUM); // Bottom-Center
     M5.Display.drawString(splashState.bottomText, screenCenterX, screenHeight - 10);
   }
@@ -737,9 +746,9 @@ void updateSplashOverlay() {
   if (millis() - splashState.startTime >= splashState.duration) {
     splashState.active = false;
     // Clear splash state
-    splashState.topText = "";
-    splashState.imagePath = "";
-    splashState.bottomText = "";
+    splashState.topText[0] = '\0';
+    splashState.imagePath[0] = '\0';
+    splashState.bottomText[0] = '\0';
   }
 }
 
@@ -764,7 +773,7 @@ bool canDrawToDisplay() {
 }
 
 // Legacy blocking function for compatibility (calls non-blocking version)
-void showSplashOverlay(String topText = "", String imagePath = "", String bottomText = "", int duration_ms = 2000) {
+void showSplashOverlay(const char* topText = "", const char* imagePath = "", const char* bottomText = "", int duration_ms = 2000) {
   startSplashOverlay(topText, imagePath, bottomText, duration_ms);
   // Note: No delay() - now non-blocking!
 }
@@ -780,7 +789,24 @@ void drawModernDisplay(float yaw, bool connected, PowerMode powerMode, float bat
     return;
   }
   
-  if (millis() - lastDisplayUpdate < DISPLAY_UPDATE_INTERVAL) {
+  // Smart adaptive display update rate based on actual activity
+  unsigned long displayInterval = DISPLAY_UPDATE_INTERVAL; // Default 10 FPS (100ms)
+  
+  // Calculate if there are pending changes that need responsive updates
+  bool hasYawChange = (abs(yaw - lastDisplayedYaw) > 0.5f); // Yaw changed more than 0.5 degrees
+  bool hasStatusChange = (connected != lastDisplayedConnected || powerMode != lastDisplayedPowerMode);
+  bool motionActive = (millis() - lastMotionTime < 5000); // Motion within last 5 seconds
+  
+  // Decide update rate based on activity
+  if (zwiftConnected || hasYawChange || hasStatusChange || motionActive) {
+    displayInterval = DISPLAY_UPDATE_INTERVAL; // 10 FPS for responsive updates
+  } else if (deviceConnected) {
+    displayInterval = 200; // 5 FPS when BLE connected but idle
+  } else {
+    displayInterval = 1000; // 1 FPS when truly idle (no connection, no changes)
+  }
+  
+  if (millis() - lastDisplayUpdate < displayInterval) {
     return;
   }
   
@@ -792,8 +818,15 @@ void drawModernDisplay(float yaw, bool connected, PowerMode powerMode, float bat
   
   int yawInt = round(yaw);
   
-  // Get comprehensive battery information
-  BatteryInfo batteryInfo = getBatteryInfo();
+  // Get comprehensive battery information (cached for power efficiency)
+  static unsigned long lastBatteryRead = 0;
+  static BatteryInfo cachedBatteryInfo;
+  
+  if (millis() - lastBatteryRead > 1000) {
+    cachedBatteryInfo = getBatteryInfo();
+    lastBatteryRead = millis();
+  }
+  BatteryInfo batteryInfo = cachedBatteryInfo;
   
   // Smooth battery voltage reading
   if (smoothedBatteryVoltage < 0) {
@@ -1054,21 +1087,37 @@ bool hasSignificantAccumulatedMotion() {
 void startBLE() {
   Serial.println("Starting BLE...");
   
-  // Configure BLE for low power
-  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-  bt_cfg.mode = ESP_BT_MODE_BLE; // BLE only mode
+  // Check if BLE controller is already initialized to prevent conflicts
+  esp_bt_controller_status_t status = esp_bt_controller_get_status();
   
-  esp_err_t ret = esp_bt_controller_init(&bt_cfg);
-  if (ret != ESP_OK) {
-    Serial.printf("ERROR: BT controller init failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
-    return;
-  }
-  
-  ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-  if (ret != ESP_OK) {
-    Serial.printf("ERROR: BT controller enable failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
-    esp_bt_controller_deinit();
-    return;
+  if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
+    // Controller not initialized - do full init
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    bt_cfg.mode = ESP_BT_MODE_BLE; // BLE only mode
+    
+    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK) {
+      Serial.printf("ERROR: BT controller init failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+      return;
+    }
+    
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret != ESP_OK) {
+      Serial.printf("ERROR: BT controller enable failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+      esp_bt_controller_deinit();
+      return;
+    }
+  } else if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
+    // Already initialized but not enabled
+    esp_err_t ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret != ESP_OK) {
+      Serial.printf("ERROR: BT controller enable failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+      return;
+    }
+  } else if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+    // Already enabled - just resume advertising
+    Serial.println("BLE controller already enabled, resuming advertising");
+    BLEDevice::startAdvertising();
   }
   
   // Ensure CPU is at 80MHz for BLE
@@ -2191,9 +2240,10 @@ void loop() {
   float minInterval = 1.0f / currentIMUFrequency; // Calculate minimum interval for current frequency
   if (dt < minInterval) {
     // Calculate delay needed to maintain target frequency
-    int delayMicros = (int)((minInterval - dt) * 1000000.0f);
-    if (delayMicros > 0 && delayMicros < 200000) { // Cap delay at 200ms
-      delayMicroseconds(delayMicros);
+    int delayMs = (int)((minInterval - dt) * 1000.0f);
+    if (delayMs > 0 && delayMs < 200) { // Cap delay at 200ms
+      // Use FreeRTOS task delay for power-efficient sleep instead of busy-wait
+      vTaskDelay(pdMS_TO_TICKS(delayMs));
     }
     M5.update(); // Update buttons even during delay
     return;
@@ -2231,9 +2281,10 @@ void loop() {
   // Update power management with current IMU readings
   updatePowerManagement(gx, gy, gz, ax, ay, az);
 
-  // Debug IMU readings every 5 seconds
+  // Debug IMU readings every 10 seconds (conditionally compiled for power savings)
+  #ifdef DEBUG_MODE
   static unsigned long lastDebugTime = 0;
-  if (millis() - lastDebugTime > 5000) {
+  if (millis() - lastDebugTime > 10000) {
     const char* powerModeStr;
     switch (currentPowerMode) {
       case POWER_BLE_ACTIVE: powerModeStr = "BLE_ACTIVE"; break;
@@ -2314,6 +2365,7 @@ void loop() {
     
     lastDebugTime = millis();
   }
+  #endif // DEBUG_MODE
 
   // Gyro drift monitoring - collect samples every second
   if (millis() - lastDriftSampleTime >= 1000) {
@@ -2446,7 +2498,7 @@ void loop() {
     unsigned long pressDuration = millis() - buttonAStartTime;
     buttonAWasPressed = false;
     
-    if (pressDuration < 1000) {
+    if (pressDuration < BUTTON_SHORT_PRESS_MS) {
       Serial.println("Button A: Short press - Waking screen");
       if (!screenOn) {
         exitScreenOffMode();
@@ -2469,7 +2521,7 @@ void loop() {
     unsigned long pressDuration = millis() - buttonBStartTime;
     buttonBWasPressed = false;
     
-    if (pressDuration < 2000) {
+    if (pressDuration < BUTTON_LONG_PRESS_MS) {
       Serial.println("Button B: Short press - Recenter");
       M5.Speaker.tone(1000, 100);
       quickRecenterYaw();
@@ -2489,7 +2541,7 @@ void loop() {
     unsigned long pressDuration = millis() - buttonCStartTime;
     buttonCWasPressed = false;
     
-    if (pressDuration < 1000) {
+    if (pressDuration < BUTTON_SHORT_PRESS_MS) {
       Serial.println("Button C: Short press - Wake screen");
       M5.Speaker.tone(1200, 100);
       
@@ -2498,7 +2550,7 @@ void loop() {
         exitScreenOffMode();
       }
       lastButtonTime = millis(); // Reset screen timer
-    } else if (pressDuration >= 1000 && pressDuration < 2000) {
+    } else if (pressDuration >= BUTTON_SHORT_PRESS_MS && pressDuration < BUTTON_LONG_PRESS_MS) {
       Serial.println("Button C: Medium press - Screen wake");
       M5.Speaker.tone(1200, 100);
       
@@ -2507,7 +2559,7 @@ void loop() {
         exitScreenOffMode();
       }
       lastButtonTime = millis(); // Reset screen timer
-    } else if (pressDuration >= 2000) {
+    } else if (pressDuration >= BUTTON_LONG_PRESS_MS) {
       Serial.println("Button C: Long press - Power off");
       
       if (screenOn) {
