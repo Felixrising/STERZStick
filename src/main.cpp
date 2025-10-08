@@ -17,7 +17,8 @@
 #include <driver/adc.h>
 #include <esp32/ulp.h>
 
-
+// —————— VERSION ——————
+#define STERZSTICK_VERSION "v1.0-RC3"
 
 #ifdef ESP32
 extern HardwareSerial Serial;
@@ -1972,6 +1973,8 @@ void saveIMUCalibration() {
 void setup() {
   Serial.begin(115200);
   Serial.println("=== STERZStick STARTUP ===");
+  Serial.print("Version: ");
+  Serial.println(STERZSTICK_VERSION);
   
   // Power management: Set HOLD pin high to maintain power
   pinMode(4, OUTPUT);
@@ -2014,7 +2017,7 @@ void setup() {
   initializeDisplayBuffer();
   
 
-  startSplashOverlay("STERZStick", "logo.jpg", "LETZride!", 2000);
+  startSplashOverlay("STERZStick", "logo.jpg", STERZSTICK_VERSION, 2000);
   
   Serial.println("Display configured at 5% brightness with modern UI");
   
