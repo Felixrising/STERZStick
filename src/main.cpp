@@ -2231,7 +2231,7 @@ void loop() {
     // Continue with main loop to ensure display updates during calibration
   }
 
-  // Calculate dynamic sample frequency with proper limiting for 10Hz
+  // Calculate dynamic sample frequency with proper limiting for accurate IMU timing
   static unsigned long lastUpdateTime = 0;
   unsigned long currentTime = micros();
   dt = (currentTime - lastUpdateTime) / 1000000.0f; // Calculate time delta in seconds
@@ -2240,10 +2240,25 @@ void loop() {
   float minInterval = 1.0f / currentIMUFrequency; // Calculate minimum interval for current frequency
   if (dt < minInterval) {
     // Calculate delay needed to maintain target frequency
-    int delayMs = (int)((minInterval - dt) * 1000.0f);
-    if (delayMs > 0 && delayMs < 200) { // Cap delay at 200ms
-      // Use FreeRTOS task delay for power-efficient sleep instead of busy-wait
-      vTaskDelay(pdMS_TO_TICKS(delayMs));
+    int delayMicros = (int)((minInterval - dt) * 1000000.0f);
+    
+    // Use hybrid approach for power efficiency with timing accuracy:
+    // - For delays >5ms: use vTaskDelay for most of the wait (power efficient)
+    // - For final <5ms: use delayMicroseconds for precision timing
+    if (delayMicros > 5000) {
+      int delayMs = (delayMicros - 1000) / 1000; // Leave 1ms for precision adjustment
+      if (delayMs > 0 && delayMs < 200) {
+        vTaskDelay(pdMS_TO_TICKS(delayMs));
+      }
+      // Recalculate remaining delay after task delay
+      unsigned long afterDelay = micros();
+      int remainingMicros = (int)((minInterval - (afterDelay - lastUpdateTime) / 1000000.0f) * 1000000.0f);
+      if (remainingMicros > 0 && remainingMicros < 5000) {
+        delayMicroseconds(remainingMicros);
+      }
+    } else if (delayMicros > 0 && delayMicros < 200000) {
+      // Short delays: use precise microsecond delay
+      delayMicroseconds(delayMicros);
     }
     M5.update(); // Update buttons even during delay
     return;
@@ -2382,6 +2397,12 @@ void loop() {
 
   // Update Mahony AHRS with calibrated data (convert gyro to radians)
   // The IMU data is already calibrated by the M5.Imu system
+  // CRITICAL: Use actual measured frequency (loopfreq) for accurate integration, not target frequency
+  float actualFreq = loopfreq;
+  if (actualFreq < 10.0f || actualFreq > 50.0f) {
+    actualFreq = currentIMUFrequency; // Fallback to target if measurement seems wrong
+  }
+  
   MahonyAHRSupdateIMU(
     filteredGx * DEG_TO_RAD,
     filteredGy * DEG_TO_RAD,
@@ -2389,7 +2410,7 @@ void loop() {
     ax,
     ay,
     az,
-    currentIMUFrequency  // Use current frequency for consistent filter behavior
+    actualFreq  // Use actual measured frequency for accurate time integration
   );
 
   // Get yaw in degrees from Mahony AHRS
