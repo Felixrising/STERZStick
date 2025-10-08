@@ -1129,6 +1129,14 @@ void startBLE() {
 void stopBLE() {
   Serial.println("Stopping BLE to save power...");
   
+  // Check current BLE controller status before attempting to stop
+  esp_bt_controller_status_t status = esp_bt_controller_get_status();
+  
+  if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
+    Serial.println("BLE already stopped");
+    return;
+  }
+  
   // Stop BLE advertising and disable controller
   try {
     BLEDevice::deinit(false);
@@ -1136,17 +1144,25 @@ void stopBLE() {
     Serial.printf("WARNING: BLEDevice::deinit() failed: %s\n", e.what());
   }
   
-  esp_err_t ret = esp_bt_controller_disable();
-  if (ret != ESP_OK) {
-    Serial.printf("WARNING: BT controller disable failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+  // Only disable if currently enabled
+  if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+    esp_err_t ret = esp_bt_controller_disable();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+      Serial.printf("WARNING: BT controller disable failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+      return; // Don't try to deinit if disable failed
+    }
   }
   
-  ret = esp_bt_controller_deinit();
-  if (ret != ESP_OK) {
-    Serial.printf("WARNING: BT controller deinit failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+  // Only deinit if not already idle
+  status = esp_bt_controller_get_status();
+  if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
+    esp_err_t ret = esp_bt_controller_deinit();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+      Serial.printf("WARNING: BT controller deinit failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
+    }
   }
   
-  Serial.println("BLE stopped");
+  Serial.println("BLE stopped successfully");
 }
 
 void enterBLEWaitingMode() {
@@ -1186,6 +1202,15 @@ void enterBLEActiveMode() {
 
 void enterLowPowerMode() {
   if (currentPowerMode != POWER_LOW_POWER) {
+    // Safety check: Don't enter low power if there's recent activity
+    unsigned long currentTime = millis();
+    unsigned long timeSinceActivity = min(currentTime - lastMotionTime, currentTime - lastButtonTime);
+    
+    if (timeSinceActivity < 60000) {
+      Serial.printf("Cannot enter low power - recent activity (%lus ago)\n", timeSinceActivity / 1000);
+      return;
+    }
+    
     Serial.println("Entering low power mode (no BLE)");
     
     // Stop BLE to save power
@@ -1387,9 +1412,14 @@ void updatePowerManagement(float gx, float gy, float gz, float ax, float ay, flo
       
       switch (currentPowerMode) {
         case POWER_BLE_WAITING: {
-          // After 5 minutes of no connection, enter low power mode
-          if (timeSinceBLEStart > BLE_WAIT_TIMEOUT) {
+          // After 5 minutes of no connection AND no user activity, enter low power mode
+          // FIX: Don't stop BLE if user is actively using the device!
+          if (timeSinceBLEStart > BLE_WAIT_TIMEOUT && timeSinceActivity > 60000) {
+            Serial.println("BLE timeout with no activity - entering low power mode");
             enterLowPowerMode();
+          } else if (timeSinceActivity < 30000) {
+            // Reset BLE timeout if user is active
+            bleStartTime = currentTime;
           }
           break;
         }
