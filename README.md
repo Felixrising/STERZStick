@@ -1,4 +1,4 @@
-# STERZStick v1.0-RC2
+# STERZStick v1.0-RC3
 
 A high-performance Zwift steering device using the M5StickCPlus2 with advanced IMU/AHRS implementation, power management, and BLE connectivity.
 
@@ -221,7 +221,40 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📝 Changelog
 
-### v1.0-RC2 (Current Release)
+### v1.0-RC3 (Current Release) ⭐ CRITICAL UPDATE
+**Critical Bug Fixes & IMU Stability Release**
+
+**CRITICAL FIXES:**
+- 🔴 **FIXED: Power Management Bug** - BLE no longer incorrectly stops after 5 minutes during active use
+  - Device now properly tracks user activity (motion, button presses)
+  - BLE timeout resets when user is active
+  - Safety checks prevent LOW_POWER mode during recent activity
+  - Resolves heading display freeze, unresponsive steering, ESP_ERR_INVALID_STATE errors
+  
+- 🔴 **FIXED: IMU Timing & Drift** - Stable heading tracking restored
+  - Hybrid delay approach: vTaskDelay + delayMicroseconds for timing precision
+  - Mahony filter now uses actual measured frequency (not target constant)
+  - Drift reduced from 3-5°/min (RC2) to <0.5°/min
+  - Smooth centering force behavior, no more wild swings
+
+- 🎯 **IMPROVED: Smart Display Updates**
+  - 10 FPS when Zwift connected OR yaw changes OR motion detected
+  - 5 FPS when BLE connected but idle
+  - 1 FPS only when truly idle (no connection, no changes)
+  - Responsive steering feel during active use
+
+**Impact:**
+- ✅ Heading display remains responsive after screen wake
+- ✅ BLE stays active indefinitely during use
+- ✅ Accurate, stable yaw tracking (minimal drift)
+- ✅ Power efficiency from RC2 maintained
+- ⚠️ **UPGRADE STRONGLY RECOMMENDED for all RC2 users**
+
+**See:** [RELEASE_NOTES_v1.0-RC3.md](RELEASE_NOTES_v1.0-RC3.md) for complete technical details
+
+---
+
+### v1.0-RC2
 **Major Power Optimization & Performance Release**
 
 **Power Optimizations:**
@@ -248,6 +281,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Smoother display updates during active use
 - More reliable BLE connection management
 - Reduced memory fragmentation
+
+**See:** [RELEASE_NOTES_v1.0-RC2.md](RELEASE_NOTES_v1.0-RC2.md)
+
+---
 
 ### v1.0-RC1
 - Added LittleFS support for splash screen images
