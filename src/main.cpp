@@ -51,6 +51,7 @@ void setupULPProgram();
 void executeCentering();
 bool isSplashActive();
 void drawSplashContent();
+bool configureBLEStack();
 
 // —————— NEW IMU CALIBRATION SYSTEM ——————
 void startIMUCalibration();
@@ -98,6 +99,7 @@ BLECharacteristic* pChar32;
 BLE2902*          p2902_14;
 BLE2902*          p2902_30;
 BLE2902*          p2902_32;
+bool              bleStackInitialized = false;
 
 bool deviceConnected = false;
 bool ind32On        = false;
@@ -1125,6 +1127,10 @@ void startBLE() {
   setCpuFrequencyMhz(BLE_CPU_FREQ);
   
   Serial.println("BLE started successfully, CPU at 80MHz");
+
+  if (!configureBLEStack()) {
+    Serial.println("ERROR: BLE stack configuration failed");
+  }
 }
 
 void stopBLE() {
@@ -1141,6 +1147,16 @@ void stopBLE() {
   // Stop BLE advertising and disable controller
   try {
     BLEDevice::deinit(false);
+    bleStackInitialized = false;
+    pServer = nullptr;
+    pSvc = nullptr;
+    pChar14 = nullptr;
+    pChar30 = nullptr;
+    pChar31 = nullptr;
+    pChar32 = nullptr;
+    p2902_14 = nullptr;
+    p2902_30 = nullptr;
+    p2902_32 = nullptr;
   } catch (const std::exception& e) {
     Serial.printf("WARNING: BLEDevice::deinit() failed: %s\n", e.what());
   }
@@ -1590,6 +1606,89 @@ class char32Desc2902Callbacks : public BLEDescriptorCallbacks {
     Serial.println("Client ENABLED indications (char32)");
   }
 };
+
+bool configureBLEStack() {
+  if (bleStackInitialized) {
+    return true;
+  }
+
+  Serial.println("Configuring BLE stack...");
+
+  try {
+    BLEDevice::init("STERZO");
+  } catch (const std::exception& e) {
+    Serial.printf("ERROR: BLE initialization failed: %s\n", e.what());
+    return false;
+  }
+
+  try {
+    pServer = BLEDevice::createServer();
+    if (!pServer) {
+      Serial.println("ERROR: Failed to create BLE server");
+      return false;
+    }
+
+    pServer->setCallbacks(new MyServerCallbacks());
+    pSvc = pServer->createService(STERZO_SERVICE_UUID);
+    if (!pSvc) {
+      Serial.println("ERROR: Failed to create BLE service");
+      return false;
+    }
+  } catch (const std::exception& e) {
+    Serial.printf("ERROR: BLE server/service setup failed: %s\n", e.what());
+    return false;
+  }
+
+  try {
+    pChar14 = pSvc->createCharacteristic(CHAR14_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    pChar30 = pSvc->createCharacteristic(CHAR30_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    pChar31 = pSvc->createCharacteristic(CHAR31_UUID, BLECharacteristic::PROPERTY_WRITE);
+    pChar32 = pSvc->createCharacteristic(CHAR32_UUID, BLECharacteristic::PROPERTY_INDICATE);
+
+    if (!pChar14 || !pChar30 || !pChar31 || !pChar32) {
+      Serial.println("ERROR: Failed to create one or more BLE characteristics");
+      return false;
+    }
+
+    p2902_14 = new BLE2902();
+    pChar14->addDescriptor(p2902_14);
+
+    p2902_30 = new BLE2902();
+    p2902_30->setNotifications(true);
+    pChar30->addDescriptor(p2902_30);
+
+    p2902_32 = new BLE2902();
+    p2902_32->setCallbacks(new char32Desc2902Callbacks());
+    pChar32->addDescriptor(p2902_32);
+
+    pChar31->setCallbacks(new char31Callbacks());
+    pChar32->setCallbacks(new char32Callbacks());
+
+    pSvc->start();
+
+    auto adv = BLEDevice::getAdvertising();
+    if (!adv) {
+      Serial.println("ERROR: Failed to get BLE advertising object");
+      return false;
+    }
+
+    adv->addServiceUUID(STERZO_SERVICE_UUID);
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x06);
+    adv->setMinPreferred(0x12);
+    adv->setMinInterval(800);
+    adv->setMaxInterval(1600);
+
+    BLEDevice::startAdvertising();
+  } catch (const std::exception& e) {
+    Serial.printf("ERROR: BLE characteristic/advertising setup failed: %s\n", e.what());
+    return false;
+  }
+
+  bleStackInitialized = true;
+  Serial.println("BLE stack configured and advertising started");
+  return true;
+}
 
 // —————— Helpers ——————
 void sendSteeringBin(float bin) {
@@ -2147,68 +2246,12 @@ void setup() {
   
   // Start BLE for initial connection attempts
   startBLE();
-  
-  try {
-    BLEDevice::init("STERZO");
-    pServer = BLEDevice::createServer();
-    if (!pServer) {
-      Serial.println("ERROR: Failed to create BLE server");
-      return;
-    }
-    
-    pServer->setCallbacks(new MyServerCallbacks());
-    pSvc = pServer->createService(STERZO_SERVICE_UUID);
-    if (!pSvc) {
-      Serial.println("ERROR: Failed to create BLE service");
-      return;
-    }
-  } catch (const std::exception& e) {
-    Serial.printf("ERROR: BLE initialization failed: %s\n", e.what());
+
+  if (!bleStackInitialized) {
+    Serial.println("ERROR: BLE stack failed to initialize");
     return;
   }
-  
-  try {
-    pChar14 = pSvc->createCharacteristic(CHAR14_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-    pChar30 = pSvc->createCharacteristic(CHAR30_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-    pChar31 = pSvc->createCharacteristic(CHAR31_UUID, BLECharacteristic::PROPERTY_WRITE);
-    pChar32 = pSvc->createCharacteristic(CHAR32_UUID, BLECharacteristic::PROPERTY_INDICATE);
-    
-    if (!pChar14 || !pChar30 || !pChar31 || !pChar32) {
-      Serial.println("ERROR: Failed to create one or more BLE characteristics");
-      return;
-    }
-    
-    p2902_14 = new BLE2902();          pChar14->addDescriptor(p2902_14);
-    p2902_30 = new BLE2902(); p2902_30->setNotifications(true); pChar30->addDescriptor(p2902_30);
-    p2902_32 = new BLE2902(); p2902_32->setCallbacks(new char32Desc2902Callbacks()); pChar32->addDescriptor(p2902_32);
 
-    pChar31->setCallbacks(new char31Callbacks());
-    pChar32->setCallbacks(new char32Callbacks());
-
-    pSvc->start();
-    
-    auto adv = BLEDevice::getAdvertising();
-    if (!adv) {
-      Serial.println("ERROR: Failed to get BLE advertising object");
-      return;
-    }
-    
-    adv->addServiceUUID(STERZO_SERVICE_UUID);
-    adv->setScanResponse(true);
-    adv->setMinPreferred(0x06);
-    adv->setMinPreferred(0x12);
-    
-    // Configure BLE advertising for low power
-    adv->setMinInterval(800);  // Longer intervals for power saving
-    adv->setMaxInterval(1600);
-    
-    BLEDevice::startAdvertising();
-    
-  } catch (const std::exception& e) {
-    Serial.printf("ERROR: BLE characteristic/advertising setup failed: %s\n", e.what());
-    return;
-  }
-  
   Serial.println("BLE advertising started - waiting for connection");
 
   // Display startup message (only if splash not active)
