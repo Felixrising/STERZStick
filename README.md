@@ -16,6 +16,28 @@ This project transforms your M5StickCPlus2 into a professional-grade steering co
 - **Drift compensation** and automatic centering
 - **Professional button handling** with short/long press actions
 
+## 🧱 Recent Development Updates
+
+The project has recently gone through a major internal refactor and behavior update:
+
+- **Modular architecture** - `main.cpp` has been reduced to orchestration, with major logic moved into:
+  - `modules/ble/BleService`
+  - `modules/display/DisplayController`
+  - `modules/power/PowerManager`
+  - `modules/sensor/ImuService`
+  - shared runtime state in `app/AppState`
+- **Board abstraction** - board-specific pin mapping and compile-time variants are in place (`M5StickCPlus2` + `M5StickS3` environments).
+- **Display UX redesign** - compact, pixel-aware layout with adaptive text fitting and cleaner steering presentation for small screens.
+- **Deferred BLE startup** - BLE init is now delayed after boot for faster UI readiness.
+- **Simplified power model** - shifted toward practical `ON -> OFF` behavior after inactivity, with board-specific shutdown behavior.
+
+## 🧭 Board Support Status
+
+- ✅ **M5StickC Plus2** - primary supported board
+- 🧪 **M5StickS3** - active development support (build + runtime scaffolding in place)
+  - PMIC-aware power-off path is implemented
+  - further PMIC mode tuning and validation is ongoing
+
 ## 🚀 Features
 
 ### Core Functionality
@@ -28,8 +50,8 @@ This project transforms your M5StickCPlus2 into a professional-grade steering co
 ### Power Management
 - ⚡ **Adaptive IMU Frequency** - 25Hz for optimal performance and power balance
 - ⚡ **CPU Frequency Scaling** - 80MHz for BLE compatibility and power efficiency
-- ⚡ **Motion-Based Sleep** - 5 minutes BLE wait, 2 minutes low power before ULP sleep
-- ⚡ **ULP Coprocessor Sleep** - Ultra-low power sleep with button wake capability
+- ⚡ **Deferred BLE Startup** - faster boot, BLE starts asynchronously after startup
+- ⚡ **Practical Auto Power-Off** - inactivity transitions to board-level off behavior
 - ⚡ **Smart Screen Control** - Auto off after 60s, motion detection keeps active
 
 ### User Interface
@@ -98,10 +120,9 @@ All dependencies are automatically managed by PlatformIO:
 
 ### Power Management
 - **BLE Active Mode** - Full performance during Zwift sessions (80MHz CPU, 25Hz IMU)
-- **BLE Waiting Mode** - Waiting for connection (80MHz CPU, reduced activity, 5min timeout)
-- **Low Power Mode** - No BLE active (80MHz CPU, IMU/button monitoring, 2min timeout)
-- **ULP Sleep Mode** - Ultra-low power with button wake capability
-- **Wake Up** - Press any button or device will auto-wake when needed
+- **BLE Waiting Mode** - Waiting for connection with inactivity timeout
+- **Auto Power-Off** - Device powers down after inactivity to minimize drain
+- **Wake Up** - Power button wake / cold boot behavior
 
 ## 🔧 Technical Details
 
@@ -220,6 +241,20 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - 🔄 **Testing** - Continuous validation with Zwift updates
 
 ## 📝 Changelog
+
+### v1.0-RC3-dev (Current Development Branch)
+**Refactor, Display Cleanup, and Multi-Board Progress**
+
+- ✅ Refactored monolithic logic into dedicated modules (`ble`, `display`, `power`, `sensor`)
+- ✅ Added shared runtime state container in `app/AppState`
+- ✅ Added compile-time board variant structure for `M5StickCPlus2` and `M5StickS3`
+- ✅ Implemented deferred BLE startup for faster startup responsiveness
+- ✅ Updated power strategy toward practical inactivity shutdown behavior
+- ✅ Improved dashboard layout for tiny screens with compact mode and pixel-aware overlays
+- ✅ Updated steering direction display (`L`/`R`) and heading rendering behavior
+- 🔄 Continued PMIC-specific power optimization and validation for M5StickS3
+
+---
 
 ### v1.0-RC3 (Current Release) ⭐ CRITICAL UPDATE
 **Critical Bug Fixes & IMU Stability Release**
