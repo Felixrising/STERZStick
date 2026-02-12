@@ -3,6 +3,7 @@
 #include <M5Unified.h>
 #include <Preferences.h>
 
+#include "boards/BoardConfig.h"
 #include "modules/display/DisplayController.h"
 
 extern float twoKp;
@@ -44,13 +45,15 @@ extern unsigned long lastDriftSampleTime;
 extern uint8_t imuCalibCountdown;
 extern bool imuCalibrationActive;
 
+extern const float YAW_DRIFT_RATE;
+extern const bool DEBUG_MODE;
+
 namespace {
 constexpr float kTwoKpDef = (2.0f * 0.5f);
 constexpr float kTwoKiDef = (2.0f * 0.0f);
 constexpr float kMotionThreshold = 10.0f;
 constexpr float kAccelMotionThreshold = 0.2f;
 constexpr int kDriftSamplesCount = 60;
-constexpr uint8_t kImuCalibStrength = 128;
 
 bool centeringActive = false;
 unsigned long centeringStartTime = 0;
@@ -339,7 +342,8 @@ void performFullCalibration() {
 
 void startIMUCalibration() {
   Serial.println("=== STARTING IMU CALIBRATION ===");
-  M5.Imu.setCalibration(kImuCalibStrength, kImuCalibStrength, 0);
+  uint8_t calStr = board::current().imuCalibStrength;
+  M5.Imu.setCalibration(calStr, calStr, 0);
   imuCalibCountdown = 10;
   isCalibrating = true;
   display::handleEvent(display::DisplayEvent::CalibrationStart);
@@ -358,7 +362,8 @@ void updateIMUCalibration(uint32_t countdown, bool clear) {
 
   if (clear) {
     if (countdown > 0) {
-      M5.Imu.setCalibration(kImuCalibStrength, kImuCalibStrength, 0);
+      uint8_t cs = board::current().imuCalibStrength;
+      M5.Imu.setCalibration(cs, cs, 0);
     } else {
       M5.Imu.setCalibration(0, 0, 0);
       saveIMUCalibration();
@@ -446,4 +451,52 @@ bool saveYawOffsetToPrefs(float offset) {
   prefs.putFloat("yoff", offset);
   prefs.end();
   return true;
+}
+
+void processYawToSteering(float rawYaw, float& outRel, float& outBin) {
+  // Validate yaw value.
+  if (isnan(rawYaw) || isinf(rawYaw)) {
+    Serial.println("WARNING: Invalid yaw value detected!");
+    rawYaw = 0.0f;
+  }
+
+  // Calculate relative yaw: raw + offset, normalise to [-180, 180].
+  float rel = rawYaw + yawOffset;
+  while (rel > 180) rel -= 360;
+  while (rel < -180) rel += 360;
+
+  // Centering force -- gradually adjust offset to bring rel back to 0.
+  static unsigned long lastCenteringTime = millis();
+  unsigned long centeringTime = millis();
+  float deltaTime = (centeringTime - lastCenteringTime) / 1000.0f;
+
+  if (deltaTime >= 1.0f) {
+    float centeringAdjustment = -rel * YAW_DRIFT_RATE * deltaTime;
+    float maxAdj = YAW_DRIFT_RATE;
+    centeringAdjustment = constrain(centeringAdjustment, -maxAdj, maxAdj);
+
+    yawOffset += centeringAdjustment;
+    while (yawOffset > 180) yawOffset -= 360;
+    while (yawOffset < -180) yawOffset += 360;
+
+    if (DEBUG_MODE && abs(centeringAdjustment) > 0.01f) {
+      float rate = centeringAdjustment / deltaTime;
+      Serial.printf("Centering: rel=%.2f adj=%.3f rate=%.3f/s dt=%.1fs\n",
+                    rel, centeringAdjustment, rate, deltaTime);
+    }
+    lastCenteringTime = centeringTime;
+  }
+
+  // Recompute with updated offset.
+  rel = rawYaw + yawOffset;
+  while (rel > 180) rel -= 360;
+  while (rel < -180) rel += 360;
+
+  // Clamp to steering range and bin to 1-degree resolution.
+  rel = constrain(rel, -40, 40);
+  float bin = round(rel / 1.0f) * 1.0f;
+  if (abs(bin) < 0.1f) bin = 0.0f;
+
+  outRel = rel;
+  outBin = bin;
 }

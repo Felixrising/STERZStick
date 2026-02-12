@@ -22,7 +22,7 @@ class ButtonController {
  private:
   int buttonAPin_;
   int buttonBPin_;
-  int buttonCPin_;
+  int buttonCPin_;   // -1 if not available (e.g. PMIC-managed power button)
   unsigned long shortPressMs_ = 1000;
   unsigned long longPressMs_ = 2000;
 

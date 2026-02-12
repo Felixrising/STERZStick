@@ -8,7 +8,6 @@ ButtonController::ButtonController(int buttonAPin, int buttonBPin, int buttonCPi
 void ButtonController::update(bool& screenOn, unsigned long& lastButtonTime) {
   bool buttonAState = !digitalRead(buttonAPin_);
   bool buttonBState = !digitalRead(buttonBPin_);
-  bool buttonCState = !digitalRead(buttonCPin_);
 
   if (buttonAState && !buttonAWasPressed_) {
     buttonAStartTime_ = millis();
@@ -51,32 +50,37 @@ void ButtonController::update(bool& screenOn, unsigned long& lastButtonTime) {
     }
   }
 
-  if (buttonCState && !buttonCWasPressed_) {
-    buttonCStartTime_ = millis();
-    buttonCWasPressed_ = true;
-    lastButtonTime = millis();
-    Serial.println("Button C pressed - resetting activity timer");
-  } else if (!buttonCState && buttonCWasPressed_) {
-    unsigned long pressDuration = millis() - buttonCStartTime_;
-    buttonCWasPressed_ = false;
+  // Button C handling -- only if this board has a readable third button GPIO.
+  if (buttonCPin_ >= 0) {
+    bool buttonCState = !digitalRead(buttonCPin_);
 
-    if (pressDuration < shortPressMs_) {
-      Serial.println("Button C: Short press - Wake screen");
-      M5.Speaker.tone(1200, 100);
-      if (!screenOn && onWakeScreen_) {
-        onWakeScreen_();
-      }
+    if (buttonCState && !buttonCWasPressed_) {
+      buttonCStartTime_ = millis();
+      buttonCWasPressed_ = true;
       lastButtonTime = millis();
-    } else if (pressDuration < longPressMs_) {
-      Serial.println("Button C: Medium press - Screen wake");
-      M5.Speaker.tone(1200, 100);
-      if (!screenOn && onWakeScreen_) {
-        onWakeScreen_();
+      Serial.println("Button C pressed - resetting activity timer");
+    } else if (!buttonCState && buttonCWasPressed_) {
+      unsigned long pressDuration = millis() - buttonCStartTime_;
+      buttonCWasPressed_ = false;
+
+      if (pressDuration < shortPressMs_) {
+        Serial.println("Button C: Short press - Wake screen");
+        M5.Speaker.tone(1200, 100);
+        if (!screenOn && onWakeScreen_) {
+          onWakeScreen_();
+        }
+        lastButtonTime = millis();
+      } else if (pressDuration < longPressMs_) {
+        Serial.println("Button C: Medium press - Screen wake");
+        M5.Speaker.tone(1200, 100);
+        if (!screenOn && onWakeScreen_) {
+          onWakeScreen_();
+        }
+        lastButtonTime = millis();
+      } else {
+        Serial.println("Button C: Long press - Power off");
+        if (onPowerOff_) onPowerOff_();
       }
-      lastButtonTime = millis();
-    } else {
-      Serial.println("Button C: Long press - Power off");
-      if (onPowerOff_) onPowerOff_();
     }
   }
 }

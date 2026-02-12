@@ -33,3 +33,8 @@ void stopIMUCalibration();
 bool loadIMUCalibration();
 void saveIMUCalibration();
 bool saveYawOffsetToPrefs(float offset);
+
+// Applies centering drift compensation and computes the final steering output.
+// outRel receives the continuous relative yaw in [-40, 40].
+// outBin receives the 1-degree binned steering angle.
+void processYawToSteering(float rawYaw, float& outRel, float& outBin);

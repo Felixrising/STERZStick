@@ -4,16 +4,19 @@ namespace board {
 
 #ifdef BOARD_M5STICKS3
 const BoardConfig& current() {
-  // Scaffold values for M5StickS3 support.
-  // TODO: validate all pins and wake GPIO assignments on hardware.
   static const BoardConfig cfg{
-      19,  // ledPin
-      4,   // holdPin
-      14,  // buttonAPin
-      0,   // buttonBPin
-      46,  // buttonCPin
-      14,  // ext0WakeGpio
-      46   // ext1WakeGpio
+      -1,    // ledPin        (no user-addressable LED GPIO; M5PM1 controls LED)
+      -1,    // holdPin       (PMIC manages power, no hold pin)
+      11,    // buttonAPin    (KEY1 = G11)
+      12,    // buttonBPin    (KEY2 = G12)
+      -1,    // buttonCPin    (power button is PMIC-managed, not a GPIO)
+      -1,    // ext0WakeGpio  (uses M5PM1 wake, not ESP32 ext wake)
+      -1,    // ext1WakeGpio
+      2,     // buttonCount
+      false, // hasHoldPin
+      true,  // hasPmicPowerOff
+      false, // hasRtcWake
+      128    // imuCalibStrength (BMI270 -- needs hardware validation)
   };
   return cfg;
 }

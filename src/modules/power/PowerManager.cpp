@@ -36,22 +36,24 @@ constexpr unsigned long kLowPowerTimeoutMs = 120000;
 constexpr unsigned long kNoMotionTimeoutConnectedMs = 300000;
 
 void requestBoardPowerOff() {
-#if defined(BOARD_M5STICKS3)
-  // M5StickS3 can use PMIC-driven power-off for true off current.
-  Serial.println("Requesting PMIC power-off (M5StickS3)...");
-  M5.Power.powerOff();
-  delay(300);
-  Serial.println("PMIC power-off did not complete, falling back to deep sleep");
-  esp_deep_sleep_start();
-#else
   const auto& cfg = board::current();
-  Serial.println("Requesting HOLD-pin power-off (M5StickC Plus2)...");
-  pinMode(cfg.holdPin, OUTPUT);
-  digitalWrite(cfg.holdPin, LOW);
-  delay(300);
-  Serial.println("HOLD power-off did not complete, falling back to deep sleep");
-  esp_deep_sleep_start();
-#endif
+  if (cfg.hasPmicPowerOff) {
+    Serial.println("Requesting PMIC power-off...");
+    M5.Power.powerOff();
+    delay(300);
+    Serial.println("PMIC power-off did not complete, falling back to deep sleep");
+    esp_deep_sleep_start();
+  } else if (cfg.hasHoldPin) {
+    Serial.println("Requesting HOLD-pin power-off...");
+    pinMode(cfg.holdPin, OUTPUT);
+    digitalWrite(cfg.holdPin, LOW);
+    delay(300);
+    Serial.println("HOLD power-off did not complete, falling back to deep sleep");
+    esp_deep_sleep_start();
+  } else {
+    Serial.println("No board power-off mechanism, entering deep sleep");
+    esp_deep_sleep_start();
+  }
 }
 }  // namespace
 
@@ -77,8 +79,17 @@ void configurePowerManagement() {
 }
 
 void setupULPProgram() {
-  Serial.println("Setting up ULP coprocessor program...");
   const auto& cfg = board::current();
+
+  // Only configure RTC GPIO wake sources on boards that support them.
+  if (!cfg.hasRtcWake) {
+    Serial.println("Board has no RTC wake support, skipping ULP/ext wake setup");
+    ulpProgramLoaded = true;
+    return;
+  }
+
+#if !CONFIG_IDF_TARGET_ESP32S3
+  Serial.println("Setting up ULP coprocessor program...");
 
   rtc_gpio_init((gpio_num_t)cfg.buttonAPin);
   rtc_gpio_set_direction((gpio_num_t)cfg.buttonAPin, RTC_GPIO_MODE_INPUT_ONLY);
@@ -90,21 +101,27 @@ void setupULPProgram() {
   rtc_gpio_pullup_en((gpio_num_t)cfg.buttonBPin);
   rtc_gpio_pulldown_dis((gpio_num_t)cfg.buttonBPin);
 
-  rtc_gpio_init((gpio_num_t)cfg.buttonCPin);
-  rtc_gpio_set_direction((gpio_num_t)cfg.buttonCPin, RTC_GPIO_MODE_INPUT_ONLY);
-  rtc_gpio_pullup_en((gpio_num_t)cfg.buttonCPin);
-  rtc_gpio_pulldown_dis((gpio_num_t)cfg.buttonCPin);
+  if (cfg.buttonCPin >= 0) {
+    rtc_gpio_init((gpio_num_t)cfg.buttonCPin);
+    rtc_gpio_set_direction((gpio_num_t)cfg.buttonCPin, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pullup_en((gpio_num_t)cfg.buttonCPin);
+    rtc_gpio_pulldown_dis((gpio_num_t)cfg.buttonCPin);
+  }
 
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)cfg.ext0WakeGpio, 0);
-  uint64_t ext1_mask = (1ULL << cfg.ext1WakeGpio);
-#if CONFIG_IDF_TARGET_ESP32S3
-  esp_sleep_enable_ext1_wakeup(ext1_mask, ESP_EXT1_WAKEUP_ANY_LOW);
+  if (cfg.ext0WakeGpio >= 0) {
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)cfg.ext0WakeGpio, 0);
+  }
+  if (cfg.ext1WakeGpio >= 0) {
+    uint64_t ext1_mask = (1ULL << cfg.ext1WakeGpio);
+    esp_sleep_enable_ext1_wakeup(ext1_mask, ESP_EXT1_WAKEUP_ALL_LOW);
+  }
+
+  Serial.println("ULP program configured with button-only wake sources");
 #else
-  esp_sleep_enable_ext1_wakeup(ext1_mask, ESP_EXT1_WAKEUP_ALL_LOW);
+  Serial.println("ESP32-S3: ext0/ext1 wake not used, skipping ULP setup");
 #endif
 
   ulpProgramLoaded = true;
-  Serial.println("ULP program configured with button-only wake sources");
 }
 
 void setupIMUWakeup() {
@@ -113,6 +130,9 @@ void setupIMUWakeup() {
 }
 
 void updateLEDBreathing() {
+  // Skip LED breathing entirely if board has no addressable LED pin.
+  if (board::current().ledPin < 0) return;
+
   static bool ledBreathingEnabled = true;
   if (!ledBreathingEnabled) {
     ledcWrite(0, 0);
@@ -190,7 +210,7 @@ void enterLowPowerMode() {
       M5.Display.sleep();
       screenOn = false;
     }
-    ledcWrite(0, 2);
+    if (board::current().ledPin >= 0) ledcWrite(0, 2);
     currentPowerMode = POWER_LOW_POWER;
     Serial.printf("Low power mode - CPU: %d MHz, BLE: OFF\n", kLowPowerCpuFreq);
   }
@@ -225,7 +245,7 @@ void enterULPSleep() {
 
   display::clearFrameBuffer();
   M5.Display.sleep();
-  ledcWrite(0, 0);
+  if (board::current().ledPin >= 0) ledcWrite(0, 0);
   screenOn = false;
   stopBLE();
 
@@ -242,9 +262,13 @@ void enterULPSleep() {
 
 void handleWakeupFromSleep() {
   const auto& cfg = board::current();
-  pinMode(cfg.holdPin, OUTPUT);
-  digitalWrite(cfg.holdPin, HIGH);
-  rtc_gpio_hold_en((gpio_num_t)cfg.holdPin);
+
+  // Re-assert hold pin if this board uses one.
+  if (cfg.hasHoldPin && cfg.holdPin >= 0) {
+    pinMode(cfg.holdPin, OUTPUT);
+    digitalWrite(cfg.holdPin, HIGH);
+    rtc_gpio_hold_en((gpio_num_t)cfg.holdPin);
+  }
 
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {

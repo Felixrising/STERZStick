@@ -10,6 +10,7 @@
 #include <esp_bt_main.h>
 
 #include "modules/display/DisplayController.h"
+#include "modules/power/PowerManager.h"
 
 #define STERZO_SERVICE_UUID "347b0001-7635-408b-8918-8ff3949ce592"
 #define CHAR14_UUID         "347b0014-7635-408b-8918-8ff3949ce592"
@@ -17,7 +18,7 @@
 #define CHAR31_UUID         "347b0031-7635-408b-8918-8ff3949ce592"
 #define CHAR32_UUID         "347b0032-7635-408b-8918-8ff3949ce592"
 
-// Shared runtime state owned in main.cpp for now.
+// Shared runtime state from AppState.
 extern BLEServer* pServer;
 extern BLEService* pSvc;
 extern BLECharacteristic* pChar14;
@@ -35,8 +36,6 @@ extern bool zwiftConnected;
 extern bool screenOn;
 extern unsigned long lastButtonTime;
 extern unsigned long lastBLEActivityTime;
-
-void exitScreenOffMode();
 
 static uint32_t rotate_left32(uint32_t value, uint32_t count) {
   const uint32_t mask = (CHAR_BIT * sizeof(value)) - 1;
@@ -250,13 +249,22 @@ bool configureBLEStack() {
 
 void startBLE() {
   Serial.println("Starting BLE...");
+
+  // If stack is already configured, just restart advertising.
+  if (bleStackInitialized) {
+    BLEDevice::startAdvertising();
+    Serial.println("BLE advertising restarted");
+    setCpuFrequencyMhz(80);
+    return;
+  }
+
+#if !CONFIG_IDF_TARGET_ESP32S3
+  // On classic ESP32, manually manage controller for restart after stopBLE.
   esp_bt_controller_status_t status = esp_bt_controller_get_status();
 
   if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-#if CONFIG_IDF_TARGET_ESP32
     bt_cfg.mode = ESP_BT_MODE_BLE;
-#endif
     esp_err_t ret = esp_bt_controller_init(&bt_cfg);
     if (ret != ESP_OK) {
       Serial.printf("ERROR: BT controller init failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
@@ -274,13 +282,12 @@ void startBLE() {
       Serial.printf("ERROR: BT controller enable failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
       return;
     }
-  } else if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
-    Serial.println("BLE controller already enabled, resuming advertising");
-    BLEDevice::startAdvertising();
   }
+  // If already enabled, fall through to configureBLEStack.
+#endif
 
   setCpuFrequencyMhz(80);
-  Serial.println("BLE started successfully, CPU at 80MHz");
+  Serial.println("BLE started, CPU at 80MHz");
 
   if (!configureBLEStack()) {
     Serial.println("ERROR: BLE stack configuration failed");
@@ -289,11 +296,6 @@ void startBLE() {
 
 void stopBLE() {
   Serial.println("Stopping BLE to save power...");
-  esp_bt_controller_status_t status = esp_bt_controller_get_status();
-  if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
-    Serial.println("BLE already stopped");
-    return;
-  }
 
   try {
     BLEDevice::deinit(false);
@@ -311,6 +313,9 @@ void stopBLE() {
     Serial.printf("WARNING: BLEDevice::deinit() failed: %s\n", e.what());
   }
 
+#if !CONFIG_IDF_TARGET_ESP32S3
+  // On classic ESP32, also tear down the BT controller.
+  esp_bt_controller_status_t status = esp_bt_controller_get_status();
   if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
     esp_err_t ret = esp_bt_controller_disable();
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
@@ -326,6 +331,7 @@ void stopBLE() {
       Serial.printf("WARNING: BT controller deinit failed: %s (0x%x)\n", esp_err_to_name(ret), ret);
     }
   }
+#endif
 
   Serial.println("BLE stopped successfully");
 }
