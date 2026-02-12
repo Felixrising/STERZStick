@@ -207,6 +207,14 @@ Debug output includes:
 
 Contributions are welcome! Please feel free to submit issues, feature requests, or pull requests.
 
+### Branching and Releases
+
+- **main** – Default branch. Contains the current stable release for end users. Clone or download this for a ready-to-use build.
+- **dev** – Active development. All ongoing work happens here. Feature branches should be created from `dev` and merged back via pull request.
+- **Releases** – Tagged commits on `dev` are promoted to `main` for generally-available (GA) releases. Use tags (e.g. `v1.0-RC4`, `v2.0-RC1`) for specific versions.
+
+To work on the project, check out `dev` or create a feature branch from it.
+
 ### Development Setup
 ```bash
 # Clone with development dependencies
